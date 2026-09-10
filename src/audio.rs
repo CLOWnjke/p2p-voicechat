@@ -8,16 +8,21 @@ use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use decibri_aec::{Aec, AecConfig};
+use df::tract::{DfParams, DfTract, RuntimeParams};
+use ndarray::Array2;
 use nnnoiseless::DenoiseState;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 /// 20 мс — стандартный размер кадра для голоса в Opus.
 pub const FRAME: usize = 960;
-/// 10 мс — кадр RNNoise. Ровно половина нашего, так что делится без остатка.
+/// 10 мс — кадр и у DeepFilterNet, и у RNNoise. Ровно половина нашего опусного,
+/// так что всё делится без остатка.
 const DENOISE_FRAME: usize = DenoiseState::FRAME_SIZE;
 
 /// Сколько звука держим в буфере на каждого собеседника, прежде чем начать
@@ -223,6 +228,8 @@ pub struct Controls {
     pub gate_sensitivity: Level,
     /// Нижний порог громкости: тише него не пропускаем даже похожее на речь.
     pub gate_floor: Level,
+    /// Модель шумоподавления загружается в фоне ~полсекунды.
+    pub dfn_ready: Arc<AtomicBool>,
     /// Уровень уже обработанного сигнала — так видно, что шумодав делает.
     pub level: Level,
     /// Оценка «сейчас говорят», которую RNNoise выдаёт заодно с очисткой.
@@ -238,6 +245,7 @@ impl Controls {
             gate: Arc::new(AtomicBool::new(true)),
             gate_sensitivity: Arc::new(AtomicU32::new(0.5f32.to_bits())),
             gate_floor: Arc::new(AtomicU32::new(0.02f32.to_bits())),
+            dfn_ready: Arc::new(AtomicBool::new(false)),
             level: Arc::new(AtomicU32::new(0)),
             voice: Arc::new(AtomicU32::new(0)),
         }
@@ -260,8 +268,19 @@ fn device_name(dev: &cpal::Device, fallback: &str) -> String {
 pub struct AudioEngine {
     _input: Stream,
     _output: Stream,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
     pub input_name: String,
     pub output_name: String,
+}
+
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Запускает захват и воспроизведение.
@@ -289,9 +308,24 @@ pub fn start(
     let out_cfg = out_dev.default_output_config()?;
 
     let reference: Reference = Arc::new(Mutex::new(VecDeque::new()));
+    let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(16);
+    let stop = Arc::new(AtomicBool::new(false));
 
-    let input = build_input(&in_dev, &in_cfg, frames_tx, controls, reference.clone())?;
-    let output = build_output(&out_dev, &out_cfg, mixer, reference)?;
+    let input = build_input(&in_dev, &in_cfg, pcm_tx)?;
+    let output = build_output(&out_dev, &out_cfg, mixer, reference.clone())?;
+
+    // Обработка живёт в своём потоке: в аудиоколбэке жёсткий дедлайн, и
+    // нейросеть там держать нельзя. Заодно это единственный способ вообще
+    // использовать DeepFilterNet — его состояние не переезжает между потоками,
+    // поэтому создаётся прямо внутри рабочего потока.
+    let worker = spawn_processing(
+        in_cfg.sample_rate(),
+        pcm_rx,
+        frames_tx,
+        controls,
+        reference,
+        stop.clone(),
+    );
 
     input.play()?;
     output.play()?;
@@ -299,6 +333,8 @@ pub fn start(
     Ok(AudioEngine {
         _input: input,
         _output: output,
+        stop,
+        worker: Some(worker),
         input_name,
         output_name,
     })
@@ -307,127 +343,22 @@ pub fn start(
 fn build_input(
     device: &cpal::Device,
     cfg: &cpal::SupportedStreamConfig,
-    frames_tx: SyncSender<Vec<i16>>,
-    controls: Controls,
-    reference: Reference,
+    pcm_tx: SyncSender<Vec<f32>>,
 ) -> Result<Stream> {
     let channels = cfg.channels() as usize;
-    let mut resampler = Resampler::new(cfg.sample_rate(), SAMPLE_RATE);
-    let mut mono: Vec<f32> = Vec::with_capacity(2048);
-    // Свежие сэмплы этого вызова, уже на 48 кГц, до эхоподавления.
-    let mut resampled: Vec<f32> = Vec::with_capacity(2048);
-    let mut echo_free: Vec<f32> = Vec::with_capacity(2048);
-    let mut ref_chunk: Vec<f32> = Vec::with_capacity(2048);
-
-    let mut aec = {
-        let mut config = AecConfig::default();
-        config.sample_rate = SAMPLE_RATE;
-        Aec::new(config).map_err(|e| anyhow!("эхоподавитель не завёлся: {e}"))?
-    };
-    // Сырой поток на 48 кГц, ещё не прошедший через шумодав.
-    let mut raw: Vec<f32> = Vec::with_capacity(DENOISE_FRAME * 4);
-    // Готовое к упаковке в Opus.
-    let mut pending: Vec<f32> = Vec::with_capacity(FRAME * 4);
-
-    let mut denoiser = DenoiseState::new();
-    let mut den_in = [0f32; DENOISE_FRAME];
-    let mut den_out = [0f32; DENOISE_FRAME];
-    let mut gate = VoiceGate::new();
-    let mut norm = [0f32; DENOISE_FRAME];
-
     let err_fn = |e| eprintln!("ошибка входного потока: {e}");
     let stream_cfg: cpal::StreamConfig = cfg.config();
 
-    let mut handle = move |samples: &[f32]| {
-        // Сводим в моно: для голоса разница между каналами не нужна.
-        mono.clear();
+    // В колбэке делаем самый минимум: сводим в моно и отдаём дальше. Здесь
+    // жёсткий дедлайн, и любая просадка слышна сразу как треск.
+    let handle = move |samples: &[f32]| {
+        let mut mono = Vec::with_capacity(samples.len() / channels.max(1) + 1);
         for chunk in samples.chunks(channels) {
             mono.push(chunk.iter().sum::<f32>() / channels as f32);
         }
-
-        // Сначала отдаём эхоподавителю всё, что успело уйти в динамики.
-        ref_chunk.clear();
-        {
-            let mut r = reference.lock().unwrap();
-            ref_chunk.extend(r.drain(..));
-        }
-        if !ref_chunk.is_empty() {
-            aec.feed_reference(&ref_chunk);
-        }
-
-        resampled.clear();
-        resampler.process(&mono, &mut resampled);
-
-        // Порядок важен: сначала убираем эхо, потом шум. Эхоподавителю нужен
-        // микрофон в том виде, в каком эхо в него пришло.
-        echo_free.clear();
-        if aec.process(&resampled, &mut echo_free).is_err() {
-            echo_free.clear();
-            echo_free.extend_from_slice(&resampled);
-        }
-
-        if controls.aec.load(Ordering::Relaxed) {
-            raw.extend_from_slice(&echo_free);
-        } else {
-            raw.extend_from_slice(&resampled);
-        }
-
-        while raw.len() >= DENOISE_FRAME {
-            // RNNoise ждёт сэмплы в шкале i16, а не в привычном диапазоне
-            // от -1 до 1 — на этом обычно и спотыкаются при интеграции.
-            for (dst, src) in den_in.iter_mut().zip(raw.drain(..DENOISE_FRAME)) {
-                *dst = src * i16::MAX as f32;
-            }
-
-            // Считаем всегда, даже когда шумодав выключен: это около процента
-            // ядра, зато нет артефактов при переключении и всегда под рукой
-            // оценка «сейчас говорят».
-            let voice = denoiser.process_frame(&mut den_out, &den_in);
-            controls.voice.store(voice.to_bits(), Ordering::Relaxed);
-
-            let source: &[f32] = if controls.denoise.load(Ordering::Relaxed) {
-                &den_out
-            } else {
-                &den_in
-            };
-
-            // Возвращаемся из шкалы i16 в привычный диапазон.
-            for (dst, src) in norm.iter_mut().zip(source) {
-                *dst = src / i16::MAX as f32;
-            }
-
-            let written_from = pending.len();
-            if controls.gate.load(Ordering::Relaxed) {
-                let sens = f32::from_bits(controls.gate_sensitivity.load(Ordering::Relaxed));
-                // Чувствительность 0 требует почти уверенной речи, 1 — почти ничего.
-                let open_thr = 0.85 - 0.70 * sens.clamp(0.0, 1.0);
-                let floor = f32::from_bits(controls.gate_floor.load(Ordering::Relaxed));
-                gate.push(&norm, voice, open_thr, floor, &mut pending);
-            } else {
-                pending.extend_from_slice(&norm);
-            }
-
-            // Уровень снимается с того, что реально уходит наружу: так на
-            // полоске видно и работу шумодава, и работу ворот.
-            let peak = pending[written_from..]
-                .iter()
-                .fold(0.0f32, |a, s| a.max(s.abs()));
-            let prev = f32::from_bits(controls.level.load(Ordering::Relaxed));
-            controls
-                .level
-                .store(peak.max(prev * 0.8).to_bits(), Ordering::Relaxed);
-        }
-
-        while pending.len() >= FRAME {
-            let frame: Vec<i16> = pending
-                .drain(..FRAME)
-                .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-                .collect();
-            if !controls.muted.load(Ordering::Relaxed) {
-                // Полный канал означает, что сеть не успевает: кадр дешевле потерять.
-                let _ = frames_tx.try_send(frame);
-            }
-        }
+        // Полная очередь означает, что обработка не успевает: блок дешевле
+        // потерять, чем задержать весь поток.
+        let _ = pcm_tx.try_send(mono);
     };
 
     let stream = match cfg.sample_format() {
@@ -454,6 +385,183 @@ fn build_input(
     };
 
     Ok(stream)
+}
+
+/// Весь тракт обработки: ресемплинг, эхоподавление, шумоподавление, ворота
+/// и нарезка на кадры Opus.
+fn spawn_processing(
+    device_rate: u32,
+    pcm_rx: Receiver<Vec<f32>>,
+    frames_tx: SyncSender<Vec<i16>>,
+    controls: Controls,
+    reference: Reference,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut resampler = Resampler::new(device_rate, SAMPLE_RATE);
+        // Свежие сэмплы, уже на 48 кГц, до эхоподавления.
+        let mut resampled: Vec<f32> = Vec::with_capacity(2048);
+        let mut echo_free: Vec<f32> = Vec::with_capacity(2048);
+        let mut ref_chunk: Vec<f32> = Vec::with_capacity(2048);
+        // Сырой поток на 48 кГц, ещё не прошедший через шумодав.
+        let mut raw: Vec<f32> = Vec::with_capacity(DENOISE_FRAME * 4);
+        // Готовое к упаковке в Opus.
+        let mut pending: Vec<f32> = Vec::with_capacity(FRAME * 4);
+
+        let mut aec = {
+            let mut config = AecConfig::default();
+            config.sample_rate = SAMPLE_RATE;
+            match Aec::new(config) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    eprintln!("эхоподавитель не завёлся: {e}");
+                    None
+                }
+            }
+        };
+
+        // Загрузка модели занимает около полусекунды. Она идёт здесь, в фоне,
+        // чтобы окно не подвисало при входе в комнату.
+        let mut dfn = match DfTract::new(DfParams::default(), &RuntimeParams::default()) {
+            Ok(d) if d.hop_size == DENOISE_FRAME => {
+                controls.dfn_ready.store(true, Ordering::Relaxed);
+                Some(d)
+            }
+            Ok(d) => {
+                eprintln!(
+                    "DeepFilterNet ждёт кадр {}, а тракт устроен на {} — работаем на RNNoise",
+                    d.hop_size, DENOISE_FRAME
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("DeepFilterNet не загрузился ({e}) — работаем на RNNoise");
+                None
+            }
+        };
+        let mut dfn_in = Array2::<f32>::zeros((1, DENOISE_FRAME));
+        let mut dfn_out = Array2::<f32>::zeros((1, DENOISE_FRAME));
+
+        // RNNoise нужен ради оценки речи, на которой держатся ворота. Если
+        // DeepFilterNet не загрузился, он же становится и шумодавом.
+        let mut rnn = DenoiseState::new();
+        let mut vad_in = [0f32; DENOISE_FRAME];
+        let mut vad_out = [0f32; DENOISE_FRAME];
+
+        let mut gate = VoiceGate::new();
+        let mut norm = [0f32; DENOISE_FRAME];
+
+        while !stop.load(Ordering::Relaxed) {
+            let mono = match pcm_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            // Сначала отдаём эхоподавителю всё, что успело уйти в динамики.
+            ref_chunk.clear();
+            {
+                let mut r = reference.lock().unwrap();
+                ref_chunk.extend(r.drain(..));
+            }
+
+            resampled.clear();
+            resampler.process(&mono, &mut resampled);
+
+            // Порядок важен: сначала убираем эхо, потом шум. Эхоподавителю
+            // нужен микрофон в том виде, в каком эхо в него пришло.
+            echo_free.clear();
+            let cancelled = match aec.as_mut() {
+                Some(a) => {
+                    if !ref_chunk.is_empty() {
+                        a.feed_reference(&ref_chunk);
+                    }
+                    a.process(&resampled, &mut echo_free).is_ok()
+                }
+                None => false,
+            };
+            if !cancelled {
+                echo_free.clear();
+                echo_free.extend_from_slice(&resampled);
+            }
+
+            if controls.aec.load(Ordering::Relaxed) {
+                raw.extend_from_slice(&echo_free);
+            } else {
+                raw.extend_from_slice(&resampled);
+            }
+
+            while raw.len() >= DENOISE_FRAME {
+                let dirty = dfn_in.as_slice_mut().unwrap();
+                for (dst, src) in dirty.iter_mut().zip(raw.drain(..DENOISE_FRAME)) {
+                    *dst = src;
+                }
+
+                // DeepFilterNet работает в привычном диапазоне от -1 до 1.
+                let dfn_ok = match dfn.as_mut() {
+                    Some(d) => d.process(dfn_in.view(), dfn_out.view_mut()).is_ok(),
+                    None => false,
+                };
+
+                // RNNoise ждёт шкалу i16, а не диапазон от -1 до 1 — на этом
+                // обычно и спотыкаются при интеграции. Считаем его всегда:
+                // нужна вероятность речи, и брать её лучше с чистого сигнала.
+                let for_vad: &[f32] = if dfn_ok {
+                    dfn_out.as_slice().unwrap()
+                } else {
+                    dfn_in.as_slice().unwrap()
+                };
+                for (dst, src) in vad_in.iter_mut().zip(for_vad) {
+                    *dst = src * i16::MAX as f32;
+                }
+                let voice = rnn.process_frame(&mut vad_out, &vad_in);
+                controls.voice.store(voice.to_bits(), Ordering::Relaxed);
+
+                if controls.denoise.load(Ordering::Relaxed) {
+                    if dfn_ok {
+                        norm.copy_from_slice(dfn_out.as_slice().unwrap());
+                    } else {
+                        // Запасной вариант, если модель не загрузилась.
+                        for (dst, src) in norm.iter_mut().zip(vad_out.iter()) {
+                            *dst = src / i16::MAX as f32;
+                        }
+                    }
+                } else {
+                    norm.copy_from_slice(dfn_in.as_slice().unwrap());
+                }
+
+                let written_from = pending.len();
+                if controls.gate.load(Ordering::Relaxed) {
+                    let sens = f32::from_bits(controls.gate_sensitivity.load(Ordering::Relaxed));
+                    // Чувствительность 0 требует почти уверенной речи, 1 — почти ничего.
+                    let open_thr = 0.85 - 0.70 * sens.clamp(0.0, 1.0);
+                    let floor = f32::from_bits(controls.gate_floor.load(Ordering::Relaxed));
+                    gate.push(&norm, voice, open_thr, floor, &mut pending);
+                } else {
+                    pending.extend_from_slice(&norm);
+                }
+
+                // Уровень снимается с того, что реально уходит наружу: так на
+                // полоске видно и работу шумодава, и работу ворот.
+                let peak = pending[written_from..]
+                    .iter()
+                    .fold(0.0f32, |a, s| a.max(s.abs()));
+                let prev = f32::from_bits(controls.level.load(Ordering::Relaxed));
+                controls
+                    .level
+                    .store(peak.max(prev * 0.8).to_bits(), Ordering::Relaxed);
+            }
+
+            while pending.len() >= FRAME {
+                let frame: Vec<i16> = pending
+                    .drain(..FRAME)
+                    .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                    .collect();
+                if !controls.muted.load(Ordering::Relaxed) {
+                    let _ = frames_tx.try_send(frame);
+                }
+            }
+        }
+    })
 }
 
 fn build_output(

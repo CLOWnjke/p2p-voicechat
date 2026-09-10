@@ -341,11 +341,19 @@ impl App {
             {
                 engine.controls.aec.store(aec, Ordering::Relaxed);
             }
+            let dfn_ready = engine.controls.dfn_ready.load(Ordering::Relaxed);
             if ui
-                .checkbox(&mut denoise, "Шумоподавление (нейросеть RNNoise)")
+                .checkbox(&mut denoise, "Шумоподавление (DeepFilterNet 3)")
                 .changed()
             {
                 engine.controls.denoise.store(denoise, Ordering::Relaxed);
+            }
+            if !dfn_ready {
+                ui.label(
+                    egui::RichText::new("модель загружается, пока работает запасной RNNoise")
+                        .small()
+                        .weak(),
+                );
             }
             if ui
                 .checkbox(&mut gate, "Только голос — глушить хлопки и стук")
