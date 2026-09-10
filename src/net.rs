@@ -16,13 +16,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::audio::{self, AudioEngine, Level, Mixer, FRAME, SAMPLE_RATE};
+use crate::audio::{self, AudioEngine, Mixer, FRAME, SAMPLE_RATE};
 use crate::nat;
 
 const MAGIC: [u8; 2] = *b"VC";
@@ -127,8 +127,7 @@ pub struct Engine {
     _audio: AudioEngine,
     punch: PunchList,
     shared: Arc<Mutex<Shared>>,
-    pub muted: Arc<AtomicBool>,
-    pub level: Level,
+    pub controls: audio::Controls,
 }
 
 impl Engine {
@@ -253,13 +252,12 @@ impl Engine {
         let locked: Locked = Arc::new(Mutex::new(None));
 
         let stop = Arc::new(AtomicBool::new(false));
-        let muted = Arc::new(AtomicBool::new(false));
-        let level: Level = Arc::new(AtomicU32::new(0));
+        let controls = audio::Controls::new();
         let mixer = Arc::new(Mixer::new());
 
         let (frames_tx, frames_rx) = sync_channel::<Vec<i16>>(8);
 
-        let audio = audio::start(frames_tx, mixer.clone(), muted.clone(), level.clone())?;
+        let audio = audio::start(frames_tx, mixer.clone(), controls.clone())?;
         {
             let mut s = shared.lock().unwrap();
             s.input_name = audio.input_name.clone();
@@ -314,8 +312,7 @@ impl Engine {
             _audio: audio,
             punch,
             shared,
-            muted,
-            level,
+            controls,
         })
     }
 }

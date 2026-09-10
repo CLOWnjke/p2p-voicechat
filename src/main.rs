@@ -301,8 +301,10 @@ impl App {
         ui.add_space(10.0);
 
         if let Some(engine) = &self.engine {
-            let level = audio::level_value(&engine.level);
-            let muted = engine.muted.load(Ordering::Relaxed);
+            let level = audio::level_value(&engine.controls.level);
+            let voice = audio::level_value(&engine.controls.voice);
+            let muted = engine.controls.muted.load(Ordering::Relaxed);
+            let mut denoise = engine.controls.denoise.load(Ordering::Relaxed);
 
             ui.label(egui::RichText::new(&input_name).small().weak());
             ui.add(
@@ -325,8 +327,27 @@ impl App {
                 .add_sized([ui.available_width(), 34.0], egui::Button::new(label))
                 .clicked()
             {
-                engine.muted.store(!muted, Ordering::Relaxed);
+                engine.controls.muted.store(!muted, Ordering::Relaxed);
             }
+
+            ui.add_space(8.0);
+            if ui
+                .checkbox(&mut denoise, "Шумоподавление (нейросеть RNNoise)")
+                .changed()
+            {
+                engine.controls.denoise.store(denoise, Ordering::Relaxed);
+            }
+            ui.label(
+                egui::RichText::new(if voice > 0.7 {
+                    "слышу голос"
+                } else if voice > 0.3 {
+                    "что-то есть"
+                } else {
+                    "тихо"
+                })
+                .small()
+                .weak(),
+            );
         }
 
         ui.add_space(8.0);

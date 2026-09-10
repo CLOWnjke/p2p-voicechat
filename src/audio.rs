@@ -7,6 +7,7 @@
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
+use nnnoiseless::DenoiseState;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -15,6 +16,8 @@ use std::sync::{Arc, Mutex};
 pub const SAMPLE_RATE: u32 = 48_000;
 /// 20 мс — стандартный размер кадра для голоса в Opus.
 pub const FRAME: usize = 960;
+/// 10 мс — кадр RNNoise. Ровно половина нашего, так что делится без остатка.
+const DENOISE_FRAME: usize = DenoiseState::FRAME_SIZE;
 
 /// Сколько звука держим в буфере на каждого собеседника, прежде чем начать
 /// выбрасывать. 100 мс: больше — заметная задержка, меньше — заикания.
@@ -119,6 +122,34 @@ pub fn level_value(level: &Level) -> f32 {
     f32::from_bits(level.load(Ordering::Relaxed))
 }
 
+/// Ручки, за которые дёргает интерфейс, и показания, которые он читает.
+#[derive(Clone)]
+pub struct Controls {
+    pub muted: Arc<AtomicBool>,
+    pub denoise: Arc<AtomicBool>,
+    /// Уровень уже обработанного сигнала — так видно, что шумодав делает.
+    pub level: Level,
+    /// Оценка «сейчас говорят», которую RNNoise выдаёт заодно с очисткой.
+    pub voice: Level,
+}
+
+impl Controls {
+    pub fn new() -> Self {
+        Self {
+            muted: Arc::new(AtomicBool::new(false)),
+            denoise: Arc::new(AtomicBool::new(true)),
+            level: Arc::new(AtomicU32::new(0)),
+            voice: Arc::new(AtomicU32::new(0)),
+        }
+    }
+}
+
+impl Default for Controls {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Имя устройства: в cpal 0.18 оно лежит внутри описания.
 fn device_name(dev: &cpal::Device, fallback: &str) -> String {
     dev.description()
@@ -140,8 +171,7 @@ pub struct AudioEngine {
 pub fn start(
     frames_tx: SyncSender<Vec<i16>>,
     mixer: Arc<Mixer>,
-    muted: Arc<AtomicBool>,
-    level: Level,
+    controls: Controls,
 ) -> Result<AudioEngine> {
     let host = cpal::default_host();
 
@@ -158,7 +188,7 @@ pub fn start(
     let in_cfg = in_dev.default_input_config()?;
     let out_cfg = out_dev.default_output_config()?;
 
-    let input = build_input(&in_dev, &in_cfg, frames_tx, muted, level)?;
+    let input = build_input(&in_dev, &in_cfg, frames_tx, controls)?;
     let output = build_output(&out_dev, &out_cfg, mixer)?;
 
     input.play()?;
@@ -176,13 +206,20 @@ fn build_input(
     device: &cpal::Device,
     cfg: &cpal::SupportedStreamConfig,
     frames_tx: SyncSender<Vec<i16>>,
-    muted: Arc<AtomicBool>,
-    level: Level,
+    controls: Controls,
 ) -> Result<Stream> {
     let channels = cfg.channels() as usize;
     let mut resampler = Resampler::new(cfg.sample_rate(), SAMPLE_RATE);
-    let mut pending: Vec<f32> = Vec::with_capacity(FRAME * 4);
     let mut mono: Vec<f32> = Vec::with_capacity(2048);
+    // Сырой поток на 48 кГц, ещё не прошедший через шумодав.
+    let mut raw: Vec<f32> = Vec::with_capacity(DENOISE_FRAME * 4);
+    // Готовое к упаковке в Opus.
+    let mut pending: Vec<f32> = Vec::with_capacity(FRAME * 4);
+
+    let mut denoiser = DenoiseState::new();
+    let mut den_in = [0f32; DENOISE_FRAME];
+    let mut den_out = [0f32; DENOISE_FRAME];
+
     let err_fn = |e| eprintln!("ошибка входного потока: {e}");
     let stream_cfg: cpal::StreamConfig = cfg.config();
 
@@ -192,20 +229,48 @@ fn build_input(
         for chunk in samples.chunks(channels) {
             mono.push(chunk.iter().sum::<f32>() / channels as f32);
         }
+        resampler.process(&mono, &mut raw);
 
-        let peak = mono.iter().fold(0.0f32, |a, s| a.max(s.abs()));
-        // Пиковый уровень с плавным спадом — иначе полоска дёргается.
-        let prev = f32::from_bits(level.load(Ordering::Relaxed));
-        level.store((peak.max(prev * 0.85)).to_bits(), Ordering::Relaxed);
+        while raw.len() >= DENOISE_FRAME {
+            // RNNoise ждёт сэмплы в шкале i16, а не в привычном диапазоне
+            // от -1 до 1 — на этом обычно и спотыкаются при интеграции.
+            for (dst, src) in den_in.iter_mut().zip(raw.drain(..DENOISE_FRAME)) {
+                *dst = src * i16::MAX as f32;
+            }
 
-        resampler.process(&mono, &mut pending);
+            // Считаем всегда, даже когда шумодав выключен: это около процента
+            // ядра, зато нет артефактов при переключении и всегда под рукой
+            // оценка «сейчас говорят».
+            let voice = denoiser.process_frame(&mut den_out, &den_in);
+            controls.voice.store(voice.to_bits(), Ordering::Relaxed);
+
+            let source: &[f32] = if controls.denoise.load(Ordering::Relaxed) {
+                &den_out
+            } else {
+                &den_in
+            };
+
+            let mut peak = 0.0f32;
+            for s in source {
+                let v = s / i16::MAX as f32;
+                peak = peak.max(v.abs());
+                pending.push(v);
+            }
+            // Пиковый уровень с плавным спадом — иначе полоска дёргается.
+            // Уровень снимается уже после очистки, чтобы работа шумодава
+            // была видна глазами.
+            let prev = f32::from_bits(controls.level.load(Ordering::Relaxed));
+            controls
+                .level
+                .store(peak.max(prev * 0.8).to_bits(), Ordering::Relaxed);
+        }
 
         while pending.len() >= FRAME {
             let frame: Vec<i16> = pending
                 .drain(..FRAME)
                 .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
                 .collect();
-            if !muted.load(Ordering::Relaxed) {
+            if !controls.muted.load(Ordering::Relaxed) {
                 // Полный канал означает, что сеть не успевает: кадр дешевле потерять.
                 let _ = frames_tx.try_send(frame);
             }
