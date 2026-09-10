@@ -19,6 +19,7 @@ igd-next = "0.17"
 base64 = "0.23"
 anyhow = "1"
 nnnoiseless = "0.5"
+decibri-aec = "0.2"
 
 [profile.release]
 opt-level = 3

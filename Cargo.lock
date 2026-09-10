@@ -672,6 +672,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "decibri-aec"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c082148c8441fc7db2c9c31aeb69842cf754ef9b8a853b40e086a2f383860fd"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3038,6 +3047,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "cpal",
+ "decibri-aec",
  "eframe",
  "igd-next",
  "nnnoiseless",

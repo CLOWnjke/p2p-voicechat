@@ -305,6 +305,7 @@ impl App {
             let voice = audio::level_value(&engine.controls.voice);
             let muted = engine.controls.muted.load(Ordering::Relaxed);
             let mut denoise = engine.controls.denoise.load(Ordering::Relaxed);
+            let mut aec = engine.controls.aec.load(Ordering::Relaxed);
 
             ui.label(egui::RichText::new(&input_name).small().weak());
             ui.add(
@@ -331,6 +332,12 @@ impl App {
             }
 
             ui.add_space(8.0);
+            if ui
+                .checkbox(&mut aec, "Эхоподавление — можно без наушников")
+                .changed()
+            {
+                engine.controls.aec.store(aec, Ordering::Relaxed);
+            }
             if ui
                 .checkbox(&mut denoise, "Шумоподавление (нейросеть RNNoise)")
                 .changed()

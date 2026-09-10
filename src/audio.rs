@@ -7,6 +7,7 @@
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
+use decibri_aec::{Aec, AecConfig};
 use nnnoiseless::DenoiseState;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -22,6 +23,13 @@ const DENOISE_FRAME: usize = DenoiseState::FRAME_SIZE;
 /// Сколько звука держим в буфере на каждого собеседника, прежде чем начать
 /// выбрасывать. 100 мс: больше — заметная задержка, меньше — заикания.
 const MAX_TRACK_SAMPLES: usize = SAMPLE_RATE as usize / 10;
+
+/// Очередь того, что уходит в динамики. Эхоподавителю нужен опорный сигнал:
+/// без него он не знает, что именно вычитать из микрофона.
+pub type Reference = Arc<Mutex<VecDeque<f32>>>;
+
+/// Больше секунды опорного сигнала держать незачем.
+const MAX_REFERENCE: usize = SAMPLE_RATE as usize;
 
 /// Смешивает дорожки всех собеседников в один поток на выход.
 pub struct Mixer {
@@ -127,6 +135,7 @@ pub fn level_value(level: &Level) -> f32 {
 pub struct Controls {
     pub muted: Arc<AtomicBool>,
     pub denoise: Arc<AtomicBool>,
+    pub aec: Arc<AtomicBool>,
     /// Уровень уже обработанного сигнала — так видно, что шумодав делает.
     pub level: Level,
     /// Оценка «сейчас говорят», которую RNNoise выдаёт заодно с очисткой.
@@ -138,6 +147,7 @@ impl Controls {
         Self {
             muted: Arc::new(AtomicBool::new(false)),
             denoise: Arc::new(AtomicBool::new(true)),
+            aec: Arc::new(AtomicBool::new(true)),
             level: Arc::new(AtomicU32::new(0)),
             voice: Arc::new(AtomicU32::new(0)),
         }
@@ -188,8 +198,10 @@ pub fn start(
     let in_cfg = in_dev.default_input_config()?;
     let out_cfg = out_dev.default_output_config()?;
 
-    let input = build_input(&in_dev, &in_cfg, frames_tx, controls)?;
-    let output = build_output(&out_dev, &out_cfg, mixer)?;
+    let reference: Reference = Arc::new(Mutex::new(VecDeque::new()));
+
+    let input = build_input(&in_dev, &in_cfg, frames_tx, controls, reference.clone())?;
+    let output = build_output(&out_dev, &out_cfg, mixer, reference)?;
 
     input.play()?;
     output.play()?;
@@ -207,10 +219,21 @@ fn build_input(
     cfg: &cpal::SupportedStreamConfig,
     frames_tx: SyncSender<Vec<i16>>,
     controls: Controls,
+    reference: Reference,
 ) -> Result<Stream> {
     let channels = cfg.channels() as usize;
     let mut resampler = Resampler::new(cfg.sample_rate(), SAMPLE_RATE);
     let mut mono: Vec<f32> = Vec::with_capacity(2048);
+    // Свежие сэмплы этого вызова, уже на 48 кГц, до эхоподавления.
+    let mut resampled: Vec<f32> = Vec::with_capacity(2048);
+    let mut echo_free: Vec<f32> = Vec::with_capacity(2048);
+    let mut ref_chunk: Vec<f32> = Vec::with_capacity(2048);
+
+    let mut aec = {
+        let mut config = AecConfig::default();
+        config.sample_rate = SAMPLE_RATE;
+        Aec::new(config).map_err(|e| anyhow!("эхоподавитель не завёлся: {e}"))?
+    };
     // Сырой поток на 48 кГц, ещё не прошедший через шумодав.
     let mut raw: Vec<f32> = Vec::with_capacity(DENOISE_FRAME * 4);
     // Готовое к упаковке в Opus.
@@ -229,7 +252,33 @@ fn build_input(
         for chunk in samples.chunks(channels) {
             mono.push(chunk.iter().sum::<f32>() / channels as f32);
         }
-        resampler.process(&mono, &mut raw);
+
+        // Сначала отдаём эхоподавителю всё, что успело уйти в динамики.
+        ref_chunk.clear();
+        {
+            let mut r = reference.lock().unwrap();
+            ref_chunk.extend(r.drain(..));
+        }
+        if !ref_chunk.is_empty() {
+            aec.feed_reference(&ref_chunk);
+        }
+
+        resampled.clear();
+        resampler.process(&mono, &mut resampled);
+
+        // Порядок важен: сначала убираем эхо, потом шум. Эхоподавителю нужен
+        // микрофон в том виде, в каком эхо в него пришло.
+        echo_free.clear();
+        if aec.process(&resampled, &mut echo_free).is_err() {
+            echo_free.clear();
+            echo_free.extend_from_slice(&resampled);
+        }
+
+        if controls.aec.load(Ordering::Relaxed) {
+            raw.extend_from_slice(&echo_free);
+        } else {
+            raw.extend_from_slice(&resampled);
+        }
 
         while raw.len() >= DENOISE_FRAME {
             // RNNoise ждёт сэмплы в шкале i16, а не в привычном диапазоне
@@ -307,6 +356,7 @@ fn build_output(
     device: &cpal::Device,
     cfg: &cpal::SupportedStreamConfig,
     mixer: Arc<Mixer>,
+    reference: Reference,
 ) -> Result<Stream> {
     let channels = cfg.channels() as usize;
     let mut resampler = Resampler::new(SAMPLE_RATE, cfg.sample_rate());
@@ -319,6 +369,14 @@ fn build_output(
         let needed = out.len() / channels;
         while staging.len() < needed {
             mixer.pull(&mut source);
+            // Ровно то, что сейчас прозвучит, — опорный сигнал для эхоподавителя.
+            {
+                let mut r = reference.lock().unwrap();
+                r.extend(source.iter().copied());
+                while r.len() > MAX_REFERENCE {
+                    r.pop_front();
+                }
+            }
             resampler.process(&source, &mut staging);
         }
         for (i, chunk) in out.chunks_mut(channels).enumerate() {
