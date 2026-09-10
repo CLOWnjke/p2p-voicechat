@@ -229,6 +229,13 @@ impl eframe::App for App {
                     });
             });
     }
+
+    /// Закрытие окна — тоже выход из комнаты. Без этого Drop у движка мог
+    /// не успеть отработать, и человек ещё несколько секунд висел бы
+    /// в чужом списке участников.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.engine = None;
+    }
 }
 
 impl App {
@@ -402,7 +409,19 @@ impl App {
     }
 
     fn ui_active(&mut self, ui: &mut egui::Ui) {
-        let (invite, upnp, peers, status, is_host, my_id, voice_seen, muted_peers, prints, trust) = {
+        let (
+            invite,
+            upnp,
+            peers,
+            status,
+            is_host,
+            my_id,
+            voice_seen,
+            peer_seen,
+            muted_peers,
+            prints,
+            trust,
+        ) = {
             let s = self.shared.lock().unwrap();
             (
                 s.invite.clone(),
@@ -412,6 +431,7 @@ impl App {
                 s.is_host,
                 s.my_id,
                 s.voice_seen.clone(),
+                s.peer_seen.clone(),
                 s.muted_peers.keys().copied().collect::<Vec<_>>(),
                 s.fingerprints.clone(),
                 s.trust.clone(),
@@ -582,11 +602,19 @@ impl App {
                     .unwrap_or(false)
             };
 
+            // Состояние приходит каждые полсекунды, так что три секунды
+            // тишины — это уже не потеря пакета, а обрыв.
+            let stale = !me
+                && peer_seen
+                    .get(id)
+                    .map(|t| t.elapsed() > Duration::from_secs(3))
+                    .unwrap_or(false);
+
             ui.add_space(7.0);
             ui.horizontal(|ui| {
-                bars(ui, active, muted);
+                bars(ui, active && !stale, muted);
                 ui.add_space(6.0);
-                let name_color = if muted {
+                let name_color = if stale || muted {
                     DIM
                 } else if me {
                     TEXT
@@ -594,6 +622,16 @@ impl App {
                     TEXT_2
                 };
                 mono(ui, name.clone(), 12.5, name_color);
+
+                if stale {
+                    ui.add_space(6.0);
+                    let resp = micro(ui, "НЕТ СВЯЗИ", DANGER);
+                    resp.on_hover_text(
+                        "От этого человека давно ничего не приходит. Обычно связь \
+                         восстанавливается сама за несколько секунд; если нет — \
+                         скорее всего у него сменилась сеть.",
+                    );
+                }
 
                 // Ключ подделать нельзя, а имя можно: если под знакомым именем
                 // пришёл другой ключ, об этом надо сказать вслух.

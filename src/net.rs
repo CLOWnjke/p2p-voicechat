@@ -52,7 +52,12 @@ const T_CHAT: u8 = 0x09;
 const T_AUTH: u8 = 0x0A;
 
 const HOST_ID: u16 = 1;
-const PEER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Через сколько молчания считаем, что человека больше нет.
+const PEER_TIMEOUT: Duration = Duration::from_secs(8);
+/// Через сколько молчания хоста считаем связь потерянной и начинаем
+/// заново стучаться. Сеть у людей меняется: отвалился VPN, переключился
+/// Wi-Fi — и внешний адрес стал другим.
+const HOST_SILENCE: Duration = Duration::from_secs(5);
 const PORT_RANGE: std::ops::Range<u16> = 47100..47120;
 
 /// Сколько кадров держим, прежде чем начать проигрывать. Три кадра — это
@@ -159,6 +164,10 @@ type PunchList = Arc<Mutex<Vec<(SocketAddr, Instant)>>>;
 /// Сколько времени продолжаем стучаться в добавленный адрес.
 const PUNCH_FOR: Duration = Duration::from_secs(180);
 
+/// Когда от хоста последний раз приходил хоть какой-то пакет. По этому
+/// гость понимает, что связь оборвалась, и начинает искать хоста заново.
+type HostSeen = Arc<Mutex<Instant>>;
+
 /// Всё, что видит интерфейс. Ничего тяжёлого сюда не кладём: блокировка берётся
 /// и из потока отрисовки, и из сетевых потоков.
 #[derive(Default)]
@@ -180,6 +189,9 @@ pub struct Shared {
     pub muted_peers: HashMap<u16, Instant>,
     /// Текстовый чат: кто и что сказал.
     pub chat: Vec<(u16, String)>,
+    /// Когда от кого приходил хоть какой-нибудь пакет. По этому в списке
+    /// видно, что человек пропал, ещё до того как его выкинет по таймауту.
+    pub peer_seen: HashMap<u16, Instant>,
     /// Отпечаток ключа каждого участника.
     pub fingerprints: HashMap<u16, String>,
     /// Кого мы встречали раньше и совпал ли ключ.
@@ -205,6 +217,10 @@ struct Peer {
     public: [u8; 32],
     /// Случайная строка, которую мы отправили и ждём подписанной обратно.
     challenge: [u8; 16],
+    /// Новый адрес, с которого человек постучался. Переезжаем на него
+    /// только после того, как он подпишет свежую задачу: иначе чужой,
+    /// знающий открытый ключ, мог бы увести на себя чужой звук.
+    pending_addr: Option<SocketAddr>,
     /// Подпись сошлась: это точно владелец ключа, а не тот, кто его скопировал.
     verified: bool,
     joined: Instant,
@@ -425,6 +441,7 @@ impl Engine {
         let punch: PunchList = Arc::new(Mutex::new(Vec::new()));
         let mesh: Direct = Arc::new(Mutex::new(HashMap::new()));
         let direct: Direct = Arc::new(Mutex::new(HashMap::new()));
+        let host_seen: HostSeen = Arc::new(Mutex::new(Instant::now()));
         let (chat_tx, chat_rx) = sync_channel::<String>(32);
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -461,6 +478,7 @@ impl Engine {
             mesh.clone(),
             direct.clone(),
             punch.clone(),
+            host_seen.clone(),
             host_addr,
             is_host,
         ));
@@ -492,6 +510,9 @@ impl Engine {
             my_id,
             chat_rx,
             identity,
+            mesh,
+            direct.clone(),
+            host_seen,
             host_addr,
             is_host,
         ));
@@ -738,11 +759,14 @@ fn spawn_rx(
     mesh: Direct,
     direct: Direct,
     punch: PunchList,
+    host_seen: HostSeen,
     host_addr: Option<SocketAddr>,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut known = Known::load();
+        // Уже были в комнате хоть раз: следующий вход — не первый, а возврат.
+        let mut was_connected = false;
         let mut streams: HashMap<u16, Incoming> = HashMap::new();
         let mut pcm = vec![0i16; FRAME * 2];
         let mut decoded: Vec<f32> = Vec::with_capacity(FRAME * 4);
@@ -759,6 +783,17 @@ fn spawn_rx(
             let kind = buf[3];
             let body = &buf[4..n];
 
+            // Любой разобранный пакет от хоста — признак, что связь жива.
+            // Молчание дольше HOST_SILENCE означает, что путь оборвался.
+            if !is_host && *locked.lock().unwrap() == Some(from) {
+                *host_seen.lock().unwrap() = Instant::now();
+                shared
+                    .lock()
+                    .unwrap()
+                    .peer_seen
+                    .insert(HOST_ID, Instant::now());
+            }
+
             match kind {
                 T_HELLO if is_host => {
                     if body.len() < 33 {
@@ -772,9 +807,20 @@ fn spawn_rx(
                         .collect::<String>();
 
                     let mut t = table.lock().unwrap();
-                    let (id, challenge) = match t.peers.iter_mut().find(|p| p.addr == from) {
-                        Some(p) => {
+                    // Человека узнаём по ключу, а не по адресу: адрес меняется
+                    // от переключения сети, а ключ — нет.
+                    let (id, challenge) = match t.peers.iter_mut().find(|p| p.public == public) {
+                        Some(p) if p.addr == from => {
                             p.last_seen = Instant::now();
+                            (p.id, p.challenge)
+                        }
+                        Some(p) => {
+                            // Тот же ключ с нового адреса — похоже, сеть у
+                            // человека сменилась. Даём свежую задачу и ждём
+                            // подписи, прежде чем переезжать.
+                            p.pending_addr = Some(from);
+                            p.challenge = identity::random_bytes::<16>();
+                            p.joined = Instant::now();
                             (p.id, p.challenge)
                         }
                         None => {
@@ -790,6 +836,7 @@ fn spawn_rx(
                                 last_seen: Instant::now(),
                                 public,
                                 challenge,
+                                pending_addr: None,
                                 verified: false,
                                 joined: Instant::now(),
                             });
@@ -818,10 +865,15 @@ fn spawn_rx(
                     sig.copy_from_slice(&body[2..66]);
 
                     let mut t = table.lock().unwrap();
-                    let Some(p) = t.peers.iter_mut().find(|p| p.id == id && p.addr == from) else {
+                    let Some(p) = t
+                        .peers
+                        .iter_mut()
+                        .find(|p| p.id == id && (p.addr == from || p.pending_addr == Some(from)))
+                    else {
                         continue;
                     };
-                    if p.verified {
+                    let moving = p.pending_addr == Some(from) && p.addr != from;
+                    if p.verified && !moving {
                         continue;
                     }
                     if !identity::verify(&p.public, &p.challenge, &sig) {
@@ -834,8 +886,20 @@ fn spawn_rx(
                         continue;
                     }
                     p.verified = true;
+                    p.last_seen = Instant::now();
+                    if moving {
+                        p.addr = from;
+                        p.pending_addr = None;
+                    }
                     let (name, fp) = (p.name.clone(), identity::fingerprint(&p.public));
                     drop(t);
+
+                    if moving {
+                        shared
+                            .lock()
+                            .unwrap()
+                            .log(format!("{name} переехал на {from}"));
+                    }
 
                     let trust = known.check(&name, &fp);
                     known.remember(&name, &fp);
@@ -929,6 +993,7 @@ fn spawn_rx(
                         let first = lock.is_none();
                         *lock = Some(from);
                         drop(lock);
+                        *host_seen.lock().unwrap() = Instant::now();
 
                         // Хост — тоже прямой путь, причём уже проверенный:
                         // именно с этого адреса он нам и ответил.
@@ -940,8 +1005,15 @@ fn spawn_rx(
                             s.my_id = id;
                             s.connected = true;
                             s.status = "в комнате".into();
-                            s.log(format!("хост ответил с {from}, наш номер {id}"));
-                            s.log(format!("ключ хоста {}", identity::fingerprint(&host_pk)));
+                            if was_connected {
+                                // Возвращение после обрыва: ключ и номер те же,
+                                // повторять их незачем.
+                                s.log(format!("связь восстановлена, хост на {from}"));
+                            } else {
+                                s.log(format!("хост ответил с {from}, наш номер {id}"));
+                                s.log(format!("ключ хоста {}", identity::fingerprint(&host_pk)));
+                            }
+                            was_connected = true;
                         }
                     }
                 }
@@ -983,8 +1055,12 @@ fn spawn_rx(
 
                     // Признак речи от собеседника: по нему интерфейс
                     // подсвечивает, кто сейчас говорит.
-                    if voiced {
-                        shared.lock().unwrap().voice_seen.insert(src, Instant::now());
+                    {
+                        let mut sh = shared.lock().unwrap();
+                        sh.peer_seen.insert(src, Instant::now());
+                        if voiced {
+                            sh.voice_seen.insert(src, Instant::now());
+                        }
                     }
 
                     let stream = match streams.entry(src) {
@@ -1031,6 +1107,7 @@ fn spawn_rx(
                     }
 
                     let mut sh = shared.lock().unwrap();
+                    sh.peer_seen.insert(src, Instant::now());
                     sh.chat.push((src, text));
                     if sh.chat.len() > 200 {
                         sh.chat.remove(0);
@@ -1053,6 +1130,7 @@ fn spawn_rx(
                     }
 
                     let mut sh = shared.lock().unwrap();
+                    sh.peer_seen.insert(src, Instant::now());
                     if muted {
                         sh.muted_peers.insert(src, Instant::now());
                     } else {
@@ -1062,12 +1140,41 @@ fn spawn_rx(
 
                 T_PING if is_host => {
                     let mut t = table.lock().unwrap();
-                    if let Some(p) = t.peers.iter_mut().find(|p| p.addr == from) {
+                    let id = t.peers.iter_mut().find(|p| p.addr == from).map(|p| {
                         p.last_seen = Instant::now();
+                        p.id
+                    });
+                    drop(t);
+                    if let Some(id) = id {
+                        shared.lock().unwrap().peer_seen.insert(id, Instant::now());
                     }
                 }
 
+                T_BYE if !is_host => {
+                    if body.len() < 2 {
+                        continue;
+                    }
+                    let who = u16::from_be_bytes([body[0], body[1]]);
+                    mixer.remove(who);
+                    let mut sh = shared.lock().unwrap();
+                    sh.peers.retain(|(id, _)| *id != who);
+                    sh.peer_seen.remove(&who);
+                    sh.voice_seen.remove(&who);
+                    sh.log(format!("#{who} вышел"));
+                    drop(sh);
+                    mesh.lock().unwrap().remove(&who);
+                    direct.lock().unwrap().remove(&who);
+                }
+
                 T_BYE if is_host => {
+                    // Гостям пересылаем как есть: они снимут человека сразу,
+                    // а не через таймаут.
+                    {
+                        let t = table.lock().unwrap();
+                        for addr in t.addrs_except(Some(from)) {
+                            let _ = socket.send_to(&buf[..n], addr);
+                        }
+                    }
                     let mut t = table.lock().unwrap();
                     if let Some(pos) = t.peers.iter().position(|p| p.addr == from) {
                         let gone = t.peers.remove(pos);
@@ -1188,12 +1295,17 @@ fn spawn_keepalive(
     my_id: Arc<Mutex<u16>>,
     chat_rx: Receiver<String>,
     identity: Arc<Identity>,
+    mesh: Direct,
+    direct: Direct,
+    host_seen: HostSeen,
     host_addr: Option<SocketAddr>,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut tick = 0u32;
         let mut hinted = false;
+        // Сколько раз подряд теряли хоста. Нужно только для сообщения в журнал.
+        let mut drops = 0u32;
 
         while !stop.load(Ordering::Relaxed) {
             // Шаг короткий, чтобы отправка сообщения не ждала полсекунды;
@@ -1274,6 +1386,34 @@ fn spawn_keepalive(
                 continue;
             }
 
+            // Сеть у людей меняется на ходу: отвалился VPN, переключился
+            // Wi-Fi — и внешний адрес стал другим. Хост об этом не знает и
+            // продолжает слать на мёртвый адрес. Поэтому, если от него давно
+            // ничего не приходило, отпускаем найденный адрес и начинаем
+            // знакомиться заново. Хост узнаёт нас по ключу и просто
+            // переставит адрес, номер и состав комнаты не поменяются.
+            if !is_host && locked.lock().unwrap().is_some() {
+                let silent = host_seen.lock().unwrap().elapsed();
+                if silent > HOST_SILENCE {
+                    *locked.lock().unwrap() = None;
+                    mesh.lock().unwrap().clear();
+                    direct.lock().unwrap().clear();
+                    mixer.retain(&[]);
+                    drops += 1;
+                    hinted = false;
+                    tick = 1;
+                    let mut s = shared.lock().unwrap();
+                    s.status = "связь потеряна, переподключаемся".into();
+                    s.peers.clear();
+                    s.voice_seen.clear();
+                    s.peer_seen.clear();
+                    s.log(format!(
+                        "от хоста {} секунд тишины — восстанавливаем связь (попытка {drops})",
+                        silent.as_secs()
+                    ));
+                }
+            }
+
             match *locked.lock().unwrap() {
                 Some(host) => {
                     let _ = socket.send_to(&header(T_PING), host);
@@ -1303,8 +1443,20 @@ fn spawn_keepalive(
             }
         }
 
-        if let Some(host) = *locked.lock().unwrap() {
-            let _ = socket.send_to(&header(T_BYE), host);
+        // Прощаемся несколько раз: один пакет UDP легко теряет, а
+        // повиснуть в чужом списке на восемь секунд — некрасиво.
+        let mut bye = header(T_BYE);
+        bye.extend_from_slice(&my_id.lock().unwrap().to_be_bytes());
+        for _ in 0..3 {
+            if is_host {
+                let addrs = table.lock().unwrap().addrs_except(None);
+                for addr in addrs {
+                    let _ = socket.send_to(&bye, addr);
+                }
+            } else if let Some(host) = *locked.lock().unwrap() {
+                let _ = socket.send_to(&bye, host);
+            }
+            thread::sleep(Duration::from_millis(40));
         }
     })
 }

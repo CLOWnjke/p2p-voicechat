@@ -40,13 +40,13 @@ pub fn spaced(s: &str) -> String {
 }
 
 /// Мелкая заглавная подпись с разрядкой.
-pub fn micro(ui: &mut Ui, text: &str, color: Color32) {
+pub fn micro(ui: &mut Ui, text: &str, color: Color32) -> egui::Response {
     ui.label(
         egui::RichText::new(spaced(text))
             .size(9.5)
             .color(color)
             .monospace(),
-    );
+    )
 }
 
 pub fn mono(ui: &mut Ui, text: impl Into<String>, size: f32, color: Color32) {
