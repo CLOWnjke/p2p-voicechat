@@ -581,6 +581,28 @@ impl App {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !me {
+                        // Квадратик показывает, идёт ли звук напрямую или
+                        // пересылается хостом.
+                        let straight = self
+                            .engine
+                            .as_ref()
+                            .map(|e| e.direct.lock().unwrap().contains_key(id))
+                            .unwrap_or(false);
+                        let (r, resp) =
+                            ui.allocate_exact_size(egui::vec2(5.0, 5.0), egui::Sense::hover());
+                        ui.painter().rect_filled(
+                            r,
+                            egui::CornerRadius::ZERO,
+                            if straight { ACCENT } else { LINE },
+                        );
+                        resp.on_hover_text(if straight {
+                            "Звук идёт напрямую, минуя хоста."
+                        } else {
+                            "Звук пока пересылается хостом: прямой путь ещё не пробит."
+                        });
+                        ui.add_space(6.0);
+                    }
                     let (r, resp) =
                         ui.allocate_exact_size(egui::vec2(58.0, 12.0), egui::Sense::hover());
                     ui.painter().text(
@@ -1084,7 +1106,7 @@ fn footer(ui: &mut egui::Ui, items: [(&str, &str); 3]) {
 
 /// Список устройств: первая строка — системное по умолчанию.
 fn device_list(ui: &mut egui::Ui, items: &[String], picked: &mut Option<String>, salt: &str) {
-    let mut row = |ui: &mut egui::Ui, label: &str, selected: bool| -> bool {
+    let row = |ui: &mut egui::Ui, label: &str, selected: bool| -> bool {
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), 26.0),
             egui::Sense::click(),

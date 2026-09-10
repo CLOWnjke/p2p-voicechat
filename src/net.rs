@@ -84,9 +84,18 @@ impl Incoming {
     /// Кладёт пакет и отдаёт всё, что уже можно проиграть.
     fn push(&mut self, seq: u16, payload: &[u8], pcm: &mut [i16], out: &mut Vec<f32>) {
         if let Some(next) = self.next {
-            // Опоздавший пакет: место, куда он должен был встать, уже проиграно.
-            if seq.wrapping_sub(next) as i16 > 0x3000 {
+            let ahead = seq.wrapping_sub(next) as i16;
+            // Опоздавший или повторный пакет: его место уже проиграно.
+            // Это же условие делает бесплатным отбрасывание дубликатов —
+            // а они появляются, как только один и тот же кадр приходит
+            // и напрямую, и пересланным через хоста.
+            if ahead < 0 {
                 return;
+            }
+            // Ушли слишком далеко вперёд — проще начать заново.
+            if ahead > 0x3000 {
+                self.pending.clear();
+                self.next = None;
             }
         }
         self.pending.insert(seq, payload.to_vec());
@@ -124,6 +133,13 @@ impl Incoming {
         }
     }
 }
+
+/// Строка состава комнаты: номер, имя, ключ и адрес, по которому до
+/// человека можно дозвониться напрямую.
+type RosterEntry = (u16, String, [u8; 32], Option<SocketAddr>);
+
+/// Куда мы умеем слать напрямую, минуя хоста.
+pub type Direct = Arc<Mutex<HashMap<u16, SocketAddr>>>;
 
 /// Громкость каждого собеседника, 0..2. Крутится из интерфейса.
 pub type Volumes = Arc<Mutex<HashMap<u16, f32>>>;
@@ -209,10 +225,10 @@ impl PeerTable {
             .collect()
     }
 
-    fn snapshot(&self) -> Vec<(u16, String, [u8; 32])> {
+    fn snapshot(&self) -> Vec<RosterEntry> {
         self.peers
             .iter()
-            .map(|p| (p.id, p.name.clone(), p.public))
+            .map(|p| (p.id, p.name.clone(), p.public, Some(p.addr)))
             .collect()
     }
 }
@@ -229,6 +245,8 @@ pub struct Prepared {
     identity: Arc<Identity>,
     /// Ключ, который хост обязан предъявить. Берётся из кода приглашения.
     expect_host: Option<[u8; 32]>,
+    /// Свой внешний адрес — хост объявляет его в составе комнаты.
+    host_addr: Option<SocketAddr>,
 }
 
 pub struct Engine {
@@ -239,6 +257,8 @@ pub struct Engine {
     shared: Arc<Mutex<Shared>>,
     pub controls: audio::Controls,
     pub volumes: Volumes,
+    /// До кого дозваниваемся напрямую, минуя хоста.
+    pub direct: Direct,
     chat_tx: SyncSender<String>,
 }
 
@@ -288,6 +308,8 @@ impl Engine {
         shared: Arc<Mutex<Shared>>,
         identity: Arc<Identity>,
     ) -> Result<Prepared> {
+        // Ниже пригодится первый кандидат: его хост объявляет своим адресом
+        // в составе комнаты, чтобы гости знали, куда стучаться напрямую.
         let (socket, port) = bind_in_range()?;
         shared
             .lock()
@@ -329,6 +351,7 @@ impl Engine {
             nickname,
             identity,
             expect_host: None,
+            host_addr: candidates.first().copied(),
         })
     }
 
@@ -369,6 +392,7 @@ impl Engine {
             nickname,
             identity,
             expect_host,
+            host_addr: None,
         })
     }
 
@@ -385,6 +409,7 @@ impl Engine {
             nickname,
             identity,
             expect_host,
+            host_addr,
         } = prepared;
 
         socket.set_read_timeout(Some(Duration::from_millis(200)))?;
@@ -396,6 +421,10 @@ impl Engine {
         }));
         let locked: Locked = Arc::new(Mutex::new(None));
         let volumes: Volumes = Arc::new(Mutex::new(HashMap::new()));
+        // Кого мы знаем по адресу и до кого уже достучались напрямую.
+        let punch: PunchList = Arc::new(Mutex::new(Vec::new()));
+        let mesh: Direct = Arc::new(Mutex::new(HashMap::new()));
+        let direct: Direct = Arc::new(Mutex::new(HashMap::new()));
         let (chat_tx, chat_rx) = sync_channel::<String>(32);
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -429,6 +458,10 @@ impl Engine {
             volumes.clone(),
             identity.clone(),
             expect_host,
+            mesh.clone(),
+            direct.clone(),
+            punch.clone(),
+            host_addr,
             is_host,
         ));
 
@@ -440,10 +473,10 @@ impl Engine {
             my_id.clone(),
             locked.clone(),
             controls.clone(),
+            mesh.clone(),
+            direct.clone(),
             is_host,
         ));
-
-        let punch: PunchList = Arc::new(Mutex::new(Vec::new()));
 
         threads.push(spawn_keepalive(
             socket,
@@ -459,6 +492,7 @@ impl Engine {
             my_id,
             chat_rx,
             identity,
+            host_addr,
             is_host,
         ));
 
@@ -470,6 +504,7 @@ impl Engine {
             shared,
             controls,
             volumes,
+            direct,
             chat_tx,
         })
     }
@@ -598,21 +633,42 @@ fn header(kind: u8) -> Vec<u8> {
 }
 
 /// Состав комнаты в пакете: [кол-во] и дальше [id u16][длина имени][имя].
-fn encode_peers(roster: &[(u16, String, [u8; 32])]) -> Vec<u8> {
+fn encode_addr(a: Option<SocketAddr>) -> [u8; 6] {
+    let mut out = [0u8; 6];
+    if let Some(SocketAddr::V4(v4)) = a {
+        out[..4].copy_from_slice(&v4.ip().octets());
+        out[4..].copy_from_slice(&v4.port().to_be_bytes());
+    }
+    out
+}
+
+fn decode_addr(b: &[u8]) -> Option<SocketAddr> {
+    let port = u16::from_be_bytes([b[4], b[5]]);
+    if port == 0 {
+        return None;
+    }
+    Some(SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3])),
+        port,
+    ))
+}
+
+fn encode_peers(roster: &[RosterEntry]) -> Vec<u8> {
     let mut msg = header(T_PEERS);
     msg.push(roster.len().min(255) as u8);
-    for (id, name, pk) in roster.iter().take(255) {
+    for (id, name, pk, addr) in roster.iter().take(255) {
         let bytes = name.as_bytes();
         let len = bytes.len().min(64);
         msg.extend_from_slice(&id.to_be_bytes());
         msg.extend_from_slice(pk);
+        msg.extend_from_slice(&encode_addr(*addr));
         msg.push(len as u8);
         msg.extend_from_slice(&bytes[..len]);
     }
     msg
 }
 
-fn decode_peers(body: &[u8]) -> Vec<(u16, String, [u8; 32])> {
+fn decode_peers(body: &[u8]) -> Vec<RosterEntry> {
     let mut out = Vec::new();
     if body.is_empty() {
         return out;
@@ -620,14 +676,15 @@ fn decode_peers(body: &[u8]) -> Vec<(u16, String, [u8; 32])> {
     let count = body[0] as usize;
     let mut i = 1usize;
     for _ in 0..count {
-        if i + 35 > body.len() {
+        if i + 41 > body.len() {
             break;
         }
         let id = u16::from_be_bytes([body[i], body[i + 1]]);
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&body[i + 2..i + 34]);
-        let len = body[i + 34] as usize;
-        i += 35;
+        let addr = decode_addr(&body[i + 34..i + 40]);
+        let len = body[i + 40] as usize;
+        i += 41;
         if i + len > body.len() {
             break;
         }
@@ -635,6 +692,7 @@ fn decode_peers(body: &[u8]) -> Vec<(u16, String, [u8; 32])> {
             id,
             String::from_utf8_lossy(&body[i..i + len]).to_string(),
             pk,
+            addr,
         ));
         i += len;
     }
@@ -647,10 +705,11 @@ fn broadcast_peers(
     table: &Arc<Mutex<PeerTable>>,
     host_name: &str,
     host_key: &[u8; 32],
-) -> Vec<(u16, String, [u8; 32])> {
+    host_addr: Option<SocketAddr>,
+) -> Vec<RosterEntry> {
     let t = table.lock().unwrap();
-    let roster: Vec<(u16, String, [u8; 32])> =
-        std::iter::once((HOST_ID, host_name.to_string(), *host_key))
+    let roster: Vec<RosterEntry> =
+        std::iter::once((HOST_ID, host_name.to_string(), *host_key, host_addr))
             .chain(t.snapshot())
             .collect();
     let addrs = t.addrs_except(None);
@@ -676,6 +735,10 @@ fn spawn_rx(
     volumes: Volumes,
     identity: Arc<Identity>,
     expect_host: Option<[u8; 32]>,
+    mesh: Direct,
+    direct: Direct,
+    punch: PunchList,
+    host_addr: Option<SocketAddr>,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -787,9 +850,9 @@ fn spawn_rx(
                         });
                     }
 
-                    let roster = broadcast_peers(&socket, &table, &nickname, &identity.public);
+                    let roster = broadcast_peers(&socket, &table, &nickname, &identity.public, host_addr);
                     let mut sh = shared.lock().unwrap();
-                    sh.peers = roster.iter().map(|(i, n, _)| (*i, n.clone())).collect();
+                    sh.peers = roster.iter().map(|(i, n, _, _)| (*i, n.clone())).collect();
                 }
 
                 T_PEERS if !is_host => {
@@ -798,12 +861,31 @@ fn spawn_rx(
                         continue;
                     }
                     // Хвосты ушедших не должны продолжать звучать.
-                    let ids: Vec<u16> = roster.iter().map(|(id, _, _)| *id).collect();
+                    let ids: Vec<u16> = roster.iter().map(|(id, _, _, _)| *id).collect();
                     mixer.retain(&ids);
 
+                    // Адреса всех участников: с этого начинается прямая связь.
+                    // Хост знакомит нас друг с другом, дальше мы стучимся
+                    // навстречу сами — никакого ручного обмена кодами.
+                    {
+                        let me = shared.lock().unwrap().my_id;
+                        let mut m = mesh.lock().unwrap();
+                        let mut p = punch.lock().unwrap();
+                        let now = Instant::now();
+                        for (id, _, _, addr) in &roster {
+                            if *id == me {
+                                continue;
+                            }
+                            let Some(a) = addr else { continue };
+                            m.insert(*id, *a);
+                            p.retain(|(x, _)| x != a);
+                            p.push((*a, now));
+                        }
+                    }
+
                     let mut sh = shared.lock().unwrap();
-                    sh.peers = roster.iter().map(|(i, n, _)| (*i, n.clone())).collect();
-                    for (id, name, pk) in &roster {
+                    sh.peers = roster.iter().map(|(i, n, _, _)| (*i, n.clone())).collect();
+                    for (id, name, pk, _) in &roster {
                         let fp = identity::fingerprint(pk);
                         let trust = known.check(name, &fp);
                         if !sh.fingerprints.contains_key(id) {
@@ -848,6 +930,11 @@ fn spawn_rx(
                         *lock = Some(from);
                         drop(lock);
 
+                        // Хост — тоже прямой путь, причём уже проверенный:
+                        // именно с этого адреса он нам и ответил.
+                        mesh.lock().unwrap().insert(HOST_ID, from);
+                        direct.lock().unwrap().insert(HOST_ID, from);
+
                         if first {
                             let mut s = shared.lock().unwrap();
                             s.my_id = id;
@@ -880,6 +967,18 @@ fn spawn_rx(
 
                     if src == *my_id.lock().unwrap() {
                         continue; // собственный голос слушать не надо
+                    }
+
+                    // Пакет пришёл прямо с адреса собеседника, а не от хоста —
+                    // значит путь пробит и дальше можно слать ему напрямую.
+                    if mesh.lock().unwrap().get(&src) == Some(&from) {
+                        let mut d = direct.lock().unwrap();
+                        if d.insert(src, from).is_none() {
+                            shared
+                                .lock()
+                                .unwrap()
+                                .log(format!("прямой путь до #{src} ({from})"));
+                        }
                     }
 
                     // Признак речи от собеседника: по нему интерфейс
@@ -978,9 +1077,9 @@ fn spawn_rx(
                             .lock()
                             .unwrap()
                             .log(format!("{} отключился", gone.name));
-                        let roster = broadcast_peers(&socket, &table, &nickname, &identity.public);
+                        let roster = broadcast_peers(&socket, &table, &nickname, &identity.public, host_addr);
                         shared.lock().unwrap().peers =
-                            roster.iter().map(|(i, n, _)| (*i, n.clone())).collect();
+                            roster.iter().map(|(i, n, _, _)| (*i, n.clone())).collect();
                     }
                 }
 
@@ -998,6 +1097,8 @@ fn spawn_tx(
     my_id: Arc<Mutex<u16>>,
     locked: Locked,
     controls: audio::Controls,
+    mesh: Direct,
+    direct: Direct,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -1045,11 +1146,22 @@ fn spawn_tx(
             seq = seq.wrapping_add(1);
 
             match target {
-                // Клиент шлёт только хосту, тот разошлёт остальным.
                 Some(host) => {
-                    let _ = socket.send_to(&msg, host);
+                    // Всем, до кого пробит прямой путь, шлём сами: это короче
+                    // и не грузит канал хоста.
+                    let known = mesh.lock().unwrap().len();
+                    let reachable: Vec<SocketAddr> =
+                        direct.lock().unwrap().values().copied().collect();
+                    for addr in &reachable {
+                        let _ = socket.send_to(&msg, *addr);
+                    }
+                    // Хосту — только пока кто-то остаётся недостижимым напрямую.
+                    // Дубликаты, если и случатся, отсеет джиттер-буфер по номеру.
+                    if reachable.len() < known || known == 0 {
+                        let _ = socket.send_to(&msg, host);
+                    }
                 }
-                // Хост шлёт всем напрямую.
+                // Хост шлёт всем напрямую: у него адреса всех есть по построению.
                 None => {
                     let addrs = table.lock().unwrap().addrs_except(None);
                     for addr in addrs {
@@ -1076,6 +1188,7 @@ fn spawn_keepalive(
     my_id: Arc<Mutex<u16>>,
     chat_rx: Receiver<String>,
     identity: Arc<Identity>,
+    host_addr: Option<SocketAddr>,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -1152,11 +1265,11 @@ fn spawn_keepalive(
                     if changed {
                         shared.lock().unwrap().log("кто-то отвалился по таймауту");
                     }
-                    let roster = broadcast_peers(&socket, &table, &nickname, &identity.public);
-                    let ids: Vec<u16> = roster.iter().map(|(id, _, _)| *id).collect();
+                    let roster = broadcast_peers(&socket, &table, &nickname, &identity.public, host_addr);
+                    let ids: Vec<u16> = roster.iter().map(|(id, _, _, _)| *id).collect();
                     mixer.retain(&ids);
                     shared.lock().unwrap().peers =
-                        roster.iter().map(|(i, n, _)| (*i, n.clone())).collect();
+                        roster.iter().map(|(i, n, _, _)| (*i, n.clone())).collect();
                 }
                 continue;
             }
