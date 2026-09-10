@@ -35,6 +35,8 @@ const T_PING: u8 = 0x04;
 const T_BYE: u8 = 0x05;
 /// Пустой пакет, который шлют «навстречу», чтобы NAT открыл путь для ответных.
 const T_PUNCH: u8 = 0x06;
+/// Состав комнаты: хост рассылает его гостям при каждом изменении.
+const T_PEERS: u8 = 0x07;
 
 const HOST_ID: u16 = 1;
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -273,7 +275,7 @@ impl Engine {
             socket.try_clone()?,
             shared.clone(),
             table.clone(),
-            mixer,
+            mixer.clone(),
             stop.clone(),
             my_id.clone(),
             nickname.clone(),
@@ -302,6 +304,7 @@ impl Engine {
             candidates,
             locked,
             punch.clone(),
+            mixer,
             is_host,
         ));
 
@@ -424,6 +427,59 @@ fn header(kind: u8) -> Vec<u8> {
     vec![MAGIC[0], MAGIC[1], VERSION, kind]
 }
 
+/// Состав комнаты в пакете: [кол-во] и дальше [id u16][длина имени][имя].
+fn encode_peers(roster: &[(u16, String)]) -> Vec<u8> {
+    let mut msg = header(T_PEERS);
+    msg.push(roster.len().min(255) as u8);
+    for (id, name) in roster.iter().take(255) {
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(64);
+        msg.extend_from_slice(&id.to_be_bytes());
+        msg.push(len as u8);
+        msg.extend_from_slice(&bytes[..len]);
+    }
+    msg
+}
+
+fn decode_peers(body: &[u8]) -> Vec<(u16, String)> {
+    let mut out = Vec::new();
+    if body.is_empty() {
+        return out;
+    }
+    let count = body[0] as usize;
+    let mut i = 1usize;
+    for _ in 0..count {
+        if i + 3 > body.len() {
+            break;
+        }
+        let id = u16::from_be_bytes([body[i], body[i + 1]]);
+        let len = body[i + 2] as usize;
+        i += 3;
+        if i + len > body.len() {
+            break;
+        }
+        out.push((id, String::from_utf8_lossy(&body[i..i + len]).to_string()));
+        i += len;
+    }
+    out
+}
+
+/// Хост рассылает всем гостям, кто сейчас в комнате.
+fn broadcast_peers(socket: &UdpSocket, table: &Arc<Mutex<PeerTable>>, host_name: &str) -> Vec<(u16, String)> {
+    let t = table.lock().unwrap();
+    let roster: Vec<(u16, String)> = std::iter::once((HOST_ID, host_name.to_string()))
+        .chain(t.snapshot())
+        .collect();
+    let addrs = t.addrs_except(None);
+    drop(t);
+
+    let msg = encode_peers(&roster);
+    for addr in addrs {
+        let _ = socket.send_to(&msg, addr);
+    }
+    roster
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_rx(
     socket: UdpSocket,
@@ -480,17 +536,26 @@ fn spawn_rx(
                             id
                         }
                     };
-                    let snapshot = t.snapshot();
                     drop(t);
 
                     let mut msg = header(T_WELCOME);
                     msg.extend_from_slice(&id.to_be_bytes());
                     let _ = socket.send_to(&msg, from);
 
-                    let mut s = shared.lock().unwrap();
-                    s.peers = std::iter::once((HOST_ID, nickname.clone()))
-                        .chain(snapshot)
-                        .collect();
+                    // Все узнают, кто теперь в комнате.
+                    let roster = broadcast_peers(&socket, &table, &nickname);
+                    shared.lock().unwrap().peers = roster;
+                }
+
+                T_PEERS if !is_host => {
+                    let roster = decode_peers(body);
+                    if roster.is_empty() {
+                        continue;
+                    }
+                    // Хвосты ушедших не должны продолжать звучать.
+                    let ids: Vec<u16> = roster.iter().map(|(id, _)| *id).collect();
+                    mixer.retain(&ids);
+                    shared.lock().unwrap().peers = roster;
                 }
 
                 T_WELCOME if !is_host => {
@@ -558,14 +623,14 @@ fn spawn_rx(
                     let mut t = table.lock().unwrap();
                     if let Some(pos) = t.peers.iter().position(|p| p.addr == from) {
                         let gone = t.peers.remove(pos);
-                        mixer.remove(gone.id);
-                        let snapshot = t.snapshot();
                         drop(t);
-                        let mut s = shared.lock().unwrap();
-                        s.log(format!("{} отключился", gone.name));
-                        s.peers = std::iter::once((HOST_ID, nickname.clone()))
-                            .chain(snapshot)
-                            .collect();
+                        mixer.remove(gone.id);
+                        shared
+                            .lock()
+                            .unwrap()
+                            .log(format!("{} отключился", gone.name));
+                        let roster = broadcast_peers(&socket, &table, &nickname);
+                        shared.lock().unwrap().peers = roster;
                     }
                 }
 
@@ -652,6 +717,7 @@ fn spawn_keepalive(
     candidates: Vec<SocketAddr>,
     locked: Locked,
     punch: PunchList,
+    mixer: Arc<Mixer>,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -678,14 +744,19 @@ fn spawn_keepalive(
                 let mut t = table.lock().unwrap();
                 let before = t.peers.len();
                 t.peers.retain(|p| p.last_seen.elapsed() < PEER_TIMEOUT);
-                if t.peers.len() != before {
-                    let snapshot = t.snapshot();
-                    drop(t);
-                    let mut s = shared.lock().unwrap();
-                    s.log("кто-то отвалился по таймауту");
-                    s.peers = std::iter::once((HOST_ID, nickname.clone()))
-                        .chain(snapshot)
-                        .collect();
+                let changed = t.peers.len() != before;
+                drop(t);
+
+                // Состав рассылаем сразу при изменении и раз в две секунды:
+                // UDP теряет пакеты, а список участников разъезжаться не должен.
+                if changed || tick % 4 == 0 {
+                    if changed {
+                        shared.lock().unwrap().log("кто-то отвалился по таймауту");
+                    }
+                    let roster = broadcast_peers(&socket, &table, &nickname);
+                    let ids: Vec<u16> = roster.iter().map(|(id, _)| *id).collect();
+                    mixer.retain(&ids);
+                    shared.lock().unwrap().peers = roster;
                 }
                 continue;
             }

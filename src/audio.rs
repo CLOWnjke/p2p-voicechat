@@ -46,6 +46,15 @@ impl Mixer {
         self.tracks.lock().unwrap().remove(&peer);
     }
 
+    /// Оставляет дорожки только тех, кто ещё в комнате. Иначе после ухода
+    /// человека его недоигранный хвост продолжал бы шуметь в микшере.
+    pub fn retain(&self, present: &[u16]) {
+        self.tracks
+            .lock()
+            .unwrap()
+            .retain(|id, _| present.contains(id));
+    }
+
     /// Забирает `out.len()` смешанных сэмплов. Молчание, если говорить некому.
     fn pull(&self, out: &mut [f32]) {
         out.fill(0.0);
