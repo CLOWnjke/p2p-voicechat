@@ -36,6 +36,17 @@ tract-onnx = "=0.21.4"
 tract-pulse = "=0.21.4"
 tract-hir = "=0.21.4"
 
+# Значок в трее. Только Windows: на прочих системах библиотека тянет GTK,
+# а нужна она там, где человек играет. Вынесено в отдельную возможность,
+# включённую по умолчанию: если однажды сборка на ней споткнётся, всё
+# остальное собирается через --no-default-features.
+[features]
+default = ["tray"]
+tray = ["dep:tray-icon"]
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.24", default-features = false, optional = true }
+
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 

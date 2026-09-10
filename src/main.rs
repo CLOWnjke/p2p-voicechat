@@ -5,6 +5,7 @@ mod audio;
 mod identity;
 mod nat;
 mod net;
+mod tray;
 mod ui;
 
 use eframe::egui;
@@ -76,6 +77,24 @@ struct App {
     identity: Arc<identity::Identity>,
     /// Имена из запомненной комнаты — для кнопки возвращения.
     last_room: Vec<String>,
+    /// Прошлый снимок счётчиков нагрузки и время, когда он сделан.
+    /// По разности получается доля ядра, без усреднений и догадок.
+    load_mark: Option<(Instant, [u64; 6])>,
+    /// Что показываем: доли ядра по этапам и число кадров окна в секунду.
+    load_shown: [f32; 6],
+    /// То же самое, но замеренное, пока окно было не в фокусе. Смотреть на
+    /// цифры во время игры невозможно — окно закрыто игрой, — поэтому
+    /// показания за игровое время запоминаются отдельно и ждут, пока на них
+    /// посмотрят.
+    load_game: [f32; 6],
+    load_game_at: Option<Instant>,
+    /// Значок в углу экрана. Пока он есть, крестик прячет окно, а не
+    /// закрывает приложение.
+    tray: Option<tray::Tray>,
+    /// Окно спрятано в значок.
+    hidden: bool,
+    /// Выходим по-настоящему: закрытие больше не перехватываем.
+    quitting: bool,
 }
 
 impl App {
@@ -100,6 +119,16 @@ impl App {
             dev_lists: None,
             identity: Arc::new(identity::Identity::load_or_create()),
             last_room: net::last_room().into_iter().map(|(_, _, n)| n).collect(),
+            load_mark: None,
+            load_shown: [0.0; 6],
+            load_game: [0.0; 6],
+            load_game_at: None,
+            tray: {
+                let (rgba, w, h) = icon_rgba();
+                tray::Tray::new(rgba, w, h)
+            },
+            hidden: false,
+            quitting: false,
         }
     }
 
@@ -187,6 +216,207 @@ impl App {
         *self.shared.lock().unwrap() = net::Shared::default();
     }
 
+    /// Значок в углу экрана: разбираем нажатия и решаем судьбу крестика.
+    ///
+    /// Крестик перехватывается только пока мы в комнате: закрывать окно,
+    /// стоя в меню, человек хочет буквально, а не «спрятать».
+    fn poll_tray(&mut self, ctx: &egui::Context) {
+        let Some(tray) = &self.tray else { return };
+        let cmds = tray.poll();
+        for cmd in cmds {
+            match cmd {
+                tray::Cmd::Show => self.unhide(ctx),
+                tray::Cmd::ToggleMute => {
+                    if let Some(e) = &self.engine {
+                        let m = &e.controls.muted;
+                        m.store(!m.load(Ordering::Relaxed), Ordering::Relaxed);
+                    }
+                }
+                tray::Cmd::Quit => {
+                    self.quitting = true;
+                    self.unhide(ctx);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.engine.is_some()
+        {
+            // Комната жива — прячем окно вместо выхода. Разговор при этом
+            // не прерывается ничем: звук и сеть живут в своих потоках.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.hidden = true;
+        }
+    }
+
+    fn unhide(&mut self, ctx: &egui::Context) {
+        if self.hidden {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            self.hidden = false;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Куда уходит процессорное время. Показываем в долях одного ядра:
+    /// проценты «всего процессора» на восьмиядерной машине ничего не
+    /// говорят, а «полядра» — говорит.
+    fn load_section(&mut self, ui: &mut egui::Ui) {
+        let Some(load) = self.engine.as_ref().map(|e| e.controls.load.clone()) else {
+            return;
+        };
+        let now = [
+            load.dsp_ns.load(Ordering::Relaxed),
+            load.enc_ns.load(Ordering::Relaxed),
+            load.rx_ns.load(Ordering::Relaxed),
+            load.ui_ns.load(Ordering::Relaxed),
+            load.ui_frames.load(Ordering::Relaxed),
+            load.sent.load(Ordering::Relaxed) + load.recv.load(Ordering::Relaxed),
+        ];
+        match self.load_mark {
+            Some((at, was)) if at.elapsed() >= Duration::from_millis(1000) => {
+                let dt = at.elapsed().as_secs_f32();
+                for i in 0..4 {
+                    // Наносекунды работы за секунду времени — это и есть
+                    // доля ядра.
+                    self.load_shown[i] = (now[i].saturating_sub(was[i])) as f32 / 1e9 / dt;
+                }
+                self.load_shown[4] = (now[4].saturating_sub(was[4])) as f32 / dt;
+                self.load_shown[5] = (now[5].saturating_sub(was[5])) as f32 / dt;
+                self.load_mark = Some((Instant::now(), now));
+                if !ui.ctx().input(|i| i.focused) {
+                    self.load_game = self.load_shown;
+                    self.load_game_at = Some(Instant::now());
+                }
+            }
+            None => self.load_mark = Some((Instant::now(), now)),
+            _ => {}
+        }
+
+        // Итог показываем по игровому замеру, если он есть: именно он
+        // отвечает на вопрос, во что приложение обходится во время игры.
+        let total: f32 = self.load_shown[..4].iter().sum();
+        let head: f32 = if self.load_game_at.is_some() {
+            self.load_game[..4].iter().sum()
+        } else {
+            total
+        };
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            micro(ui, "НАГРУЗКА", DIM);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                mono(
+                    ui,
+                    spaced(&format!("{:.0}% ЯДРА", head * 100.0)),
+                    9.5,
+                    if head > 0.35 { DANGER } else { FAINT },
+                )
+            });
+        });
+        ui.add_space(6.0);
+        hairline(ui, LINE_DIM);
+        ui.add_space(7.0);
+        ui.horizontal(|ui| {
+            mono(ui, "", 10.0, DIM);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (r, resp) =
+                    ui.allocate_exact_size(egui::vec2(62.0, 11.0), egui::Sense::hover());
+                ui.painter().text(
+                    r.right_center(),
+                    egui::Align2::RIGHT_CENTER,
+                    spaced("СЕЙЧАС"),
+                    egui::FontId::monospace(9.0),
+                    FAINT,
+                );
+                resp.on_hover_text("Замер прямо сейчас, когда окно перед вами.");
+                let (r, resp) =
+                    ui.allocate_exact_size(egui::vec2(62.0, 11.0), egui::Sense::hover());
+                ui.painter().text(
+                    r.right_center(),
+                    egui::Align2::RIGHT_CENTER,
+                    spaced("В ИГРЕ"),
+                    egui::FontId::monospace(9.0),
+                    ACCENT,
+                );
+                resp.on_hover_text(
+                    "Последний замер, сделанный пока окно было не в фокусе — то есть \
+                     пока вы играли. Ради него всё и затевалось: смотреть на цифры \
+                     во время игры невозможно, поэтому они дожидаются вас здесь.",
+                );
+            });
+        });
+
+        let pct = |v: f32| format!("{:.1}%", v * 100.0);
+        let rows: [(&str, [String; 2], &str); 5] = [
+            (
+                "обработка микрофона",
+                [pct(self.load_shown[0]), pct(self.load_game[0])],
+                "Эхоподавитель, нейросетевой шумодав и ворота. Считается всё время, пока вы в комнате, независимо от того, говорите вы или молчите.",
+            ),
+            (
+                "упаковка и отправка",
+                [pct(self.load_shown[1]), pct(self.load_game[1])],
+                "Кодирование Opus и отправка пакетов. Речь кодировать дороже, чем тишину, — эта строка растёт, когда вы говорите.",
+            ),
+            (
+                "приём и разбор",
+                [pct(self.load_shown[2]), pct(self.load_game[2])],
+                "Разбор пришедших пакетов, декодирование и микширование. Растёт, когда говорят вам.",
+            ),
+            (
+                "отрисовка окна",
+                [pct(self.load_shown[3]), pct(self.load_game[3])],
+                "Самое дорогое, что может делать приложение во время игры: каждый нарисованный кадр выводится на экран и мешает игре держать монопольный полноэкранный режим. Свёрнутое или перекрытое окно должно давать здесь около нуля.",
+            ),
+            (
+                "кадров окна в секунду",
+                [
+                    format!("{:.0}", self.load_shown[4]),
+                    format!("{:.0}", self.load_game[4]),
+                ],
+                "Сколько раз в секунду окно перерисовывается. В фокусе — около шестидесяти, за игрой должно упасть до четырёх, свёрнутым — до одного.",
+            ),
+        ];
+        for (name, values, hint) in rows {
+            ui.add_space(7.0);
+            ui.horizontal(|ui| {
+                mono(ui, name, 11.0, TEXT_2);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (i, v) in values.iter().enumerate() {
+                        let (r, _) =
+                            ui.allocate_exact_size(egui::vec2(62.0, 13.0), egui::Sense::hover());
+                        ui.painter().text(
+                            r.right_center(),
+                            egui::Align2::RIGHT_CENTER,
+                            v,
+                            egui::FontId::monospace(11.0),
+                            if i == 0 { TEXT } else { ACCENT },
+                        );
+                    }
+                });
+            })
+            .response
+            .on_hover_text(hint);
+        }
+        ui.add_space(7.0);
+        ui.horizontal(|ui| {
+            mono(ui, "пакетов в секунду", 11.0, DIM);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                mono(ui, format!("{:.0}", self.load_shown[5]), 11.0, DIM);
+            });
+        });
+        if let Some(at) = self.load_game_at {
+            ui.add_space(6.0);
+            mono(
+                ui,
+                format!("замер в игре сделан {} с назад", at.elapsed().as_secs()),
+                10.0,
+                FAINT,
+            );
+        }
+    }
+
     /// Мгновенная атака, плавный спад — так ведут себя настоящие индикаторы.
     /// Пик держится отдельно и спадает медленнее, чтобы успеть его заметить.
     fn update_meter(&mut self, level: f32) {
@@ -206,8 +436,35 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let painting = Instant::now();
         self.poll_pending();
-        ui.ctx().request_repaint_after(Duration::from_millis(16));
+        self.poll_tray(ui.ctx());
+
+        // Пока окно не на переднем плане, перерисовываться шестьдесят раз в
+        // секунду незачем: человек в это время играет. Каждый наш кадр — это
+        // полноценный кадр OpenGL с выводом на экран, а окно, которое
+        // непрерывно выводит кадры, вынуждает игру уйти из монопольного
+        // полноэкранного режима в композитный. Отсюда и берутся потерянные
+        // кадры — не из наших вычислений, они ничтожны, а из того, что мы
+        // всё время лезем на экран.
+        //
+        // Смотреть на индикатор во время игры всё равно некому, поэтому
+        // фоном обновляемся четыре раза в секунду, а свёрнутыми — раз в
+        // секунду, только чтобы не спать вечным сном.
+        let (focused, minimized) = ui.ctx().input(|i| {
+            (
+                i.focused,
+                i.viewport().minimized.unwrap_or(false),
+            )
+        });
+        let period = if minimized || self.hidden {
+            1000
+        } else if focused {
+            16
+        } else {
+            250
+        };
+        ui.ctx().request_repaint_after(Duration::from_millis(period));
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG))
@@ -247,6 +504,11 @@ impl eframe::App for App {
                             });
                     });
             });
+
+        if let Some(load) = self.engine.as_ref().map(|e| e.controls.load.clone()) {
+            load.ui_frames.fetch_add(1, Ordering::Relaxed);
+            audio::Load::add(&load.ui_ns, painting);
+        }
     }
 
     /// Закрытие окна — тоже выход из комнаты. Без этого Drop у движка мог
@@ -794,6 +1056,16 @@ impl App {
             return;
         }
 
+        if self.tray.is_some() {
+            ui.add_space(8.0);
+            mono(
+                ui,
+                "выйти из комнаты можно только отсюда: крестик прячет окно\nв значок у часов, разговор при этом продолжается",
+                10.0,
+                FAINT,
+            );
+        }
+
         ui.add_space(14.0);
         let total = self
             .engine
@@ -942,6 +1214,7 @@ impl App {
 
             ui.add_space(12.0);
             chain(ui, aec, denoise, gate);
+            self.load_section(ui);
             ui.add_space(16.0);
             hairline(ui, LINE);
             ui.add_space(10.0);
@@ -1381,6 +1654,17 @@ fn setup_theme(ctx: &egui::Context) {
 /// в комнате помечена речь: так не нужен ни файл, ни распаковщик PNG.
 /// Файл `assets/icon.ico` — та же картинка для иконки самого exe.
 fn app_icon() -> egui::IconData {
+    let (rgba, width, height) = icon_rgba();
+    egui::IconData {
+        rgba,
+        width,
+        height,
+    }
+}
+
+/// Картинка приложения: три полоски эквалайзера с угловыми засечками.
+/// Рисуется кодом, чтобы не тащить файл и не расходиться с интерфейсом.
+fn icon_rgba() -> (Vec<u8>, u32, u32) {
     const S: i32 = 256;
     let mut rgba = vec![0u8; (S * S * 4) as usize];
 
@@ -1411,11 +1695,7 @@ fn app_icon() -> egui::IconData {
         put(x0 + i as i32 * (bar_w + gap), base - h, bar_w, h, accent);
     }
 
-    egui::IconData {
-        rgba,
-        width: S as u32,
-        height: S as u32,
-    }
+    (rgba, S as u32, S as u32)
 }
 
 fn default_nickname() -> String {

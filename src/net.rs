@@ -617,6 +617,7 @@ impl Engine {
             punch.clone(),
             host_seen.clone(),
             room.clone(),
+            controls.load.clone(),
         ));
 
         threads.push(spawn_tx(
@@ -1099,6 +1100,7 @@ fn spawn_rx(
     punch: PunchList,
     host_seen: HostSeen,
     room: RoomRef,
+    load: Arc<audio::Load>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut known = Known::load();
@@ -1117,6 +1119,7 @@ fn spawn_rx(
             if n < 4 || buf[0..2] != MAGIC || buf[2] != VERSION {
                 continue;
             }
+            let started = Instant::now();
             let kind = buf[3];
             let body = &buf[4..n];
             // Роль может смениться посреди встречи, поэтому спрашиваем её
@@ -1628,6 +1631,11 @@ fn spawn_rx(
 
                 _ => {}
             }
+
+            if kind == T_AUDIO {
+                load.recv.fetch_add(1, Ordering::Relaxed);
+            }
+            audio::Load::add(&load.rx_ns, started);
         }
     })
 }
@@ -1674,6 +1682,7 @@ fn spawn_tx(
                 continue;
             }
 
+            let started = Instant::now();
             let len = match encoder.encode(&frame, &mut out) {
                 Ok(l) => l,
                 Err(_) => continue,
@@ -1713,6 +1722,8 @@ fn spawn_tx(
                     }
                 }
             }
+            controls.load.sent.fetch_add(1, Ordering::Relaxed);
+            audio::Load::add(&controls.load.enc_ns, started);
         }
     })
 }

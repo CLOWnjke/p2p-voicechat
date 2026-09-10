@@ -12,7 +12,7 @@ use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::Array2;
 use nnnoiseless::DenoiseState;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -227,6 +227,36 @@ pub fn level_value(level: &Level) -> f32 {
     f32::from_bits(level.load(Ordering::Relaxed))
 }
 
+/// Счётчики потраченного времени, по одному на этап.
+///
+/// Считаем не «сколько занял последний кадр», а сумму наносекунд с начала
+/// работы. Интерфейс берёт разность за прошедшее время — и это сразу доля
+/// ядра, без всяких усреднений и догадок. Мерить нужно потому, что
+/// рассуждения о стоимости этапов уже один раз разошлись с тем, что человек
+/// видит в игре, а измерение не спорит.
+#[derive(Default)]
+pub struct Load {
+    /// Обработка микрофона: эхоподавитель, шумодав, ворота.
+    pub dsp_ns: AtomicU64,
+    /// Упаковка в Opus и отправка.
+    pub enc_ns: AtomicU64,
+    /// Разбор пришедших пакетов, декодирование, микширование.
+    pub rx_ns: AtomicU64,
+    /// Отрисовка окна.
+    pub ui_ns: AtomicU64,
+    /// Сколько кадров окна нарисовано.
+    pub ui_frames: AtomicU64,
+    /// Сколько звуковых пакетов отправлено и принято.
+    pub sent: AtomicU64,
+    pub recv: AtomicU64,
+}
+
+impl Load {
+    pub fn add(counter: &AtomicU64, since: std::time::Instant) {
+        counter.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
 /// Ручки, за которые дёргает интерфейс, и показания, которые он читает.
 #[derive(Clone)]
 pub struct Controls {
@@ -252,6 +282,8 @@ pub struct Controls {
     pub ptt_down: Arc<AtomicBool>,
     /// Какую клавишу слушать.
     pub ptt_key: Arc<Mutex<String>>,
+    /// Куда уходит время. Нужно, чтобы разговор о нагрузке вёлся числами.
+    pub load: Arc<Load>,
 }
 
 impl Controls {
@@ -275,6 +307,7 @@ impl Controls {
             ptt: Arc::new(AtomicBool::new(false)),
             ptt_down: Arc::new(AtomicBool::new(false)),
             ptt_key: Arc::new(Mutex::new("F8".to_string())),
+            load: Arc::new(Load::default()),
         }
     }
 }
@@ -599,6 +632,7 @@ fn spawn_processing(
                 raw.extend_from_slice(&resampled);
             }
 
+            let dsp_started = std::time::Instant::now();
             while raw.len() >= DENOISE_FRAME {
                 let dirty = dfn_in.as_slice_mut().unwrap();
                 for (dst, src) in dirty.iter_mut().zip(raw.drain(..DENOISE_FRAME)) {
@@ -664,6 +698,8 @@ fn spawn_processing(
                     .level
                     .store(rms.max(prev * 0.93).to_bits(), Ordering::Relaxed);
             }
+
+            Load::add(&controls.load.dsp_ns, dsp_started);
 
             while pending.len() >= FRAME {
                 let frame: Vec<i16> = pending
