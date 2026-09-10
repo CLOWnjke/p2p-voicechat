@@ -45,6 +45,9 @@ struct App {
     code_input: String,
     punch_input: String,
     chat_input: String,
+    /// Сколько сообщений уже видели: разница с нынешним числом и есть
+    /// счётчик непрочитанного.
+    chat_seen: usize,
     error: Option<String>,
     engine: Option<net::Engine>,
     pending: Option<Receiver<Result<net::Prepared, String>>>,
@@ -73,6 +76,7 @@ impl App {
             code_input: String::new(),
             punch_input: String::new(),
             chat_input: String::new(),
+            chat_seen: 0,
             error: None,
             engine: None,
             pending: None,
@@ -157,6 +161,7 @@ impl App {
         self.phase = Phase::Menu;
         self.punch_input.clear();
         self.chat_input.clear();
+        self.chat_seen = 0;
         self.disp = 0.0;
         self.peak = 0.0;
         *self.shared.lock().unwrap() = net::Shared::default();
@@ -259,6 +264,33 @@ impl App {
             };
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 mono(ui, spaced(label), 9.5, color);
+
+                // Непрочитанное видно и тогда, когда секция чата свёрнута
+                // или уехала за край прокрутки.
+                if matches!(self.phase, Phase::Active) {
+                    let unread = self
+                        .shared
+                        .lock()
+                        .unwrap()
+                        .chat
+                        .len()
+                        .saturating_sub(self.chat_seen);
+                    if unread > 0 {
+                        ui.add_space(10.0);
+                        let (r, resp) = ui.allocate_exact_size(
+                            egui::vec2(30.0, 12.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().text(
+                            r.right_center(),
+                            egui::Align2::RIGHT_CENTER,
+                            format!("+{unread}"),
+                            egui::FontId::monospace(9.5),
+                            ACCENT,
+                        );
+                        resp.on_hover_text("Новые сообщения в чате");
+                    }
+                }
                 ui.add_space(6.0);
                 let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
                 if color == ACCENT {
@@ -646,8 +678,8 @@ impl App {
         self.mic_section(ui);
         ui.add_space(20.0);
 
-        self.chain_section(ui);
         self.chat_section(ui, &peers);
+        self.chain_section(ui);
         self.punch_section(ui);
         self.log_section(ui);
         hairline(ui, LINE);
@@ -956,16 +988,35 @@ impl App {
             let s = self.shared.lock().unwrap();
             (s.chat.clone(), s.my_id)
         };
-        let tag = chat.len().to_string();
-        let mut state = section(ui, "chat", "ЧАТ", Some((&tag, FAINT)));
+        let unread = chat.len().saturating_sub(self.chat_seen);
+        let tag = if unread > 0 {
+            format!("+{unread}")
+        } else {
+            chat.len().to_string()
+        };
+        let mut state = section(
+            ui,
+            "chat",
+            "ЧАТ",
+            Some((&tag, if unread > 0 { ACCENT } else { FAINT })),
+        );
+
+        // Пока секция открыта, всё прочитано.
+        if state.is_open() {
+            self.chat_seen = chat.len();
+        }
 
         state.show_body_unindented(ui, |ui| {
             ui.add_space(8.0);
             egui::ScrollArea::vertical()
-                .max_height(190.0)
+                .max_height(300.0)
+                // Без этого область ужимается по содержимому, и полоса
+                // прокрутки повисает посреди окна.
+                .auto_shrink([false, false])
                 .stick_to_bottom(true)
                 .id_salt("chat")
                 .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     if chat.is_empty() {
                         mono(ui, "пока пусто", 11.0, FAINT);
                     }
@@ -976,36 +1027,39 @@ impl App {
                             .map(|(_, n)| n.clone())
                             .unwrap_or_else(|| format!("#{id}"));
                         ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.spacing_mut().item_spacing.x = 8.0;
                             let (r, _) = ui.allocate_exact_size(
-                                egui::vec2(84.0, 15.0),
+                                egui::vec2(80.0, 16.0),
                                 egui::Sense::hover(),
                             );
-                            let short: String = name.chars().take(11).collect();
+                            let short: String = name.chars().take(10).collect();
                             ui.painter().text(
-                                r.right_top() + egui::vec2(0.0, 1.0),
+                                r.right_top() + egui::vec2(0.0, 2.0),
                                 egui::Align2::RIGHT_TOP,
                                 short,
                                 egui::FontId::monospace(11.0),
                                 if *id == my_id { ACCENT } else { DIM },
                             );
-                            ui.label(
-                                egui::RichText::new(text)
-                                    .size(11.5)
-                                    .color(TEXT_2)
-                                    .monospace(),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(text)
+                                        .size(12.0)
+                                        .color(TEXT_2)
+                                        .monospace(),
+                                )
+                                .wrap(),
                             );
                         });
-                        ui.add_space(3.0);
+                        ui.add_space(5.0);
                     }
                 });
 
-            ui.add_space(10.0);
-            let resp = field(ui, &mut self.chat_input, "написать…", 12.5, 36.0, Some(400));
-            let entered = resp.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.add_space(12.0);
+            let resp = field(ui, &mut self.chat_input, "написать…", 12.5, 38.0, Some(400));
+            let entered =
+                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(8.0);
-            let clicked = button(ui, "ОТПРАВИТЬ", 32.0, None, None, Some(DIMMER), TEXT, 10.5)
+            let clicked = button(ui, "ОТПРАВИТЬ", 34.0, None, None, Some(DIMMER), TEXT, 10.5)
                 .clicked();
 
             if entered || clicked {
