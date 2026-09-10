@@ -98,12 +98,18 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// Путь к файлу рядом с настройками. Каталог у всех свой, поэтому спрашиваем
+/// его у системы, а не собираем руками.
+pub fn config_file(name: &str) -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "voicechat").map(|d| d.config_dir().join(name))
+}
+
 fn key_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "voicechat").map(|d| d.config_dir().join("identity.key"))
+    config_file("identity.key")
 }
 
 fn known_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "voicechat").map(|d| d.config_dir().join("known_peers"))
+    config_file("known_peers")
 }
 
 fn read_seed(path: &PathBuf) -> Option<[u8; 32]> {

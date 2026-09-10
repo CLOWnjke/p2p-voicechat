@@ -33,6 +33,15 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// С чего начинаем встречу.
+#[derive(Clone, Copy, PartialEq)]
+enum Start {
+    Host,
+    Join,
+    /// Возвращение в запомненную комнату: стучимся ко всем, кого помним.
+    Return,
+}
+
 enum Phase {
     Menu,
     Connecting(String),
@@ -65,6 +74,8 @@ struct App {
     dev_lists: Option<(Vec<String>, Vec<String>)>,
     /// Своя пара ключей: имя — это просто строка, а ключ подделать нельзя.
     identity: Arc<identity::Identity>,
+    /// Имена из запомненной комнаты — для кнопки возвращения.
+    last_room: Vec<String>,
 }
 
 impl App {
@@ -88,16 +99,23 @@ impl App {
             devices: audio::DevicePrefs::default(),
             dev_lists: None,
             identity: Arc::new(identity::Identity::load_or_create()),
+            last_room: net::last_room().into_iter().map(|(_, _, n)| n).collect(),
         }
     }
 
+    /// Что запускаем: свою комнату, вход по коду или возвращение в ту,
+    /// где мы уже были.
     fn begin(&mut self, host: bool) {
+        self.begin_mode(if host { Start::Host } else { Start::Join });
+    }
+
+    fn begin_mode(&mut self, mode: Start) {
         let nickname = self.nickname.trim().to_string();
         if nickname.is_empty() {
             self.error = Some("Введите имя".into());
             return;
         }
-        if !host && self.code_input.trim().is_empty() {
+        if matches!(mode, Start::Join) && self.code_input.trim().is_empty() {
             self.error = Some("Вставьте код приглашения".into());
             return;
         }
@@ -111,20 +129,20 @@ impl App {
         let id = self.identity.clone();
 
         std::thread::spawn(move || {
-            let result = if host {
-                net::Engine::prepare_host(nickname, shared, id)
-            } else {
-                net::Engine::prepare_join(&code, nickname, shared, id)
+            let result = match mode {
+                Start::Host => net::Engine::prepare_host(nickname, shared, id),
+                Start::Join => net::Engine::prepare_join(&code, nickname, shared, id),
+                Start::Return => net::Engine::prepare_return(nickname, shared, id),
             };
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
         self.pending = Some(rx);
         self.phase = Phase::Connecting(
-            if host {
-                "ОТКРЫВАЕМ ПОРТ"
-            } else {
-                "ИЩЕМ ХОСТА"
+            match mode {
+                Start::Host => "ОТКРЫВАЕМ ПОРТ",
+                Start::Join => "ИЩЕМ ХОСТА",
+                Start::Return => "СТУЧИМСЯ КО ВСЕМ",
             }
             .into(),
         );
@@ -160,6 +178,7 @@ impl App {
     fn leave(&mut self) {
         self.engine = None; // Drop останавливает потоки и звук
         self.phase = Phase::Menu;
+        self.last_room = net::last_room().into_iter().map(|(_, _, n)| n).collect();
         self.punch_input.clear();
         self.chat_input.clear();
         self.chat_seen = 0;
@@ -345,6 +364,41 @@ impl App {
             .color(DIM)
             .monospace(),
         );
+
+        // Возвращение показываем прежде всего остального: если человек
+        // только что вылетел, это единственное, чего он хочет.
+        if !self.last_room.is_empty() {
+            ui.add_space(26.0);
+            micro(ui, "ВЫ УЖЕ БЫЛИ ЗДЕСЬ", DIM);
+            ui.add_space(6.0);
+            let who: Vec<&str> = self
+                .last_room
+                .iter()
+                .map(|n| n.as_str())
+                .filter(|n| !n.is_empty())
+                .collect();
+            mono(ui, who.join(", "), 11.5, TEXT_2);
+            ui.add_space(10.0);
+            if button(
+                ui,
+                "ВЕРНУТЬСЯ В КОМНАТУ",
+                40.0,
+                None,
+                None,
+                Some(ACCENT),
+                ACCENT,
+                11.5,
+            )
+            .on_hover_text(
+                "Постучимся сразу ко всем, кого помним по прошлой встрече. \
+                 Кто на месте — тот и ответит, а если хостом стал другой, \
+                 он на него покажет. Код спрашивать не надо.",
+            )
+            .clicked()
+            {
+                self.begin_mode(Start::Return);
+            }
+        }
 
         ui.add_space(30.0);
         micro(ui, "ИМЯ", DIM);

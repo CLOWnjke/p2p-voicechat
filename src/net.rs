@@ -15,6 +15,7 @@ use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use std::collections::HashMap;
+use std::fs;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -28,10 +29,10 @@ pub use crate::identity::Trust;
 use crate::nat;
 
 const MAGIC: [u8; 2] = *b"VC";
-// Версия 3: в рукопожатие добавлены ключи и проверка подписи. Со старыми
-// сборками намеренно несовместимо — лучше не соединиться, чем разбирать
-// чужой формат и выдавать кашу.
-const VERSION: u8 = 3;
+// Версия 4: комната переживает уход хоста — оставшиеся выбирают нового.
+// Со старыми сборками намеренно несовместимо — лучше не соединиться, чем
+// разбирать чужой формат и выдавать кашу.
+const VERSION: u8 = 4;
 
 const T_HELLO: u8 = 0x01;
 const T_WELCOME: u8 = 0x02;
@@ -50,6 +51,8 @@ const T_STATE: u8 = 0x08;
 const T_CHAT: u8 = 0x09;
 /// Ответ на присланную хостом случайную строку, подписанный своим ключом.
 const T_AUTH: u8 = 0x0A;
+/// «Хост теперь я»: рассылает тот, кого выбрали после ухода прежнего.
+const T_HOST: u8 = 0x0B;
 
 const HOST_ID: u16 = 1;
 /// Через сколько молчания считаем, что человека больше нет.
@@ -58,6 +61,13 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(8);
 /// заново стучаться. Сеть у людей меняется: отвалился VPN, переключился
 /// Wi-Fi — и внешний адрес стал другим.
 const HOST_SILENCE: Duration = Duration::from_secs(5);
+/// Через сколько молчания хоста считаем, что он ушёл совсем, и выбираем
+/// нового. Заметно больше HOST_SILENCE: сначала надо дать шанс простому
+/// переподключению, смена хоста — крайняя мера.
+const HOST_GONE: Duration = Duration::from_secs(12);
+/// Насколько свежим должен быть след человека, чтобы считать его живым
+/// при выборе нового хоста.
+const ALIVE_FOR: Duration = Duration::from_secs(10);
 const PORT_RANGE: std::ops::Range<u16> = 47100..47120;
 
 /// Сколько кадров держим, прежде чем начать проигрывать. Три кадра — это
@@ -168,6 +178,53 @@ const PUNCH_FOR: Duration = Duration::from_secs(180);
 /// гость понимает, что связь оборвалась, и начинает искать хоста заново.
 type HostSeen = Arc<Mutex<Instant>>;
 
+/// Кто сейчас хост и как его найти.
+///
+/// Раньше это решалось один раз при запуске: создал комнату — хост, вошёл по
+/// коду — гость. Но хост — обычный человек, он может закрыть приложение
+/// первым, и комната не должна умирать вместе с ним. Поэтому «кто хост» —
+/// состояние, которое живёт всю встречу и может смениться.
+///
+/// Выбор нового делается без переговоров: у всех на руках один и тот же
+/// состав, и каждый берёт из него живого участника с наименьшим номером.
+/// Раз правило одинаковое, все приходят к одному ответу сами.
+struct Room {
+    is_host: AtomicBool,
+    /// Номер того, кто сейчас хост.
+    host_id: Mutex<u16>,
+    /// Ключ, который хост обязан предъявить. Сначала берётся из кода
+    /// приглашения, после смены — из состава комнаты.
+    expect_host: Mutex<Option<[u8; 32]>>,
+    /// Адреса, в которые стучимся, пока не нашли хоста.
+    targets: Mutex<Vec<SocketAddr>>,
+    /// Свои адреса. Лежат наготове: если хостом станем мы, из них
+    /// собирается новый код приглашения.
+    mine: Vec<SocketAddr>,
+    /// Свой внешний адрес — хост объявляет его в составе комнаты.
+    my_addr: Mutex<Option<SocketAddr>>,
+    /// Последний известный состав. Только по нему и можно выбрать нового
+    /// хоста, когда прежнего уже не спросить.
+    roster: Mutex<Vec<RosterEntry>>,
+    /// Хост попрощался явно — ждать двенадцать секунд тишины незачем.
+    host_gone: AtomicBool,
+    /// Мы уже были в комнате. Пока нет — тишина означает, что мы просто не
+    /// дозвонились, и выбирать нового хоста не из чего: состав, поднятый
+    /// из памяти, это лишь список тех, к кому мы стучимся.
+    joined: AtomicBool,
+}
+
+type RoomRef = Arc<Room>;
+
+impl Room {
+    fn is_host(&self) -> bool {
+        self.is_host.load(Ordering::Relaxed)
+    }
+
+    fn host_id(&self) -> u16 {
+        *self.host_id.lock().unwrap()
+    }
+}
+
 /// Всё, что видит интерфейс. Ничего тяжёлого сюда не кладём: блокировка берётся
 /// и из потока отрисовки, и из сетевых потоков.
 #[derive(Default)]
@@ -256,6 +313,10 @@ pub struct Prepared {
     socket: UdpSocket,
     /// Пусто — значит мы хост.
     candidates: Vec<SocketAddr>,
+    /// Свои адреса: пригодятся, если хостом придётся стать нам.
+    mine: Vec<SocketAddr>,
+    /// Состав запомненной комнаты, если возвращаемся в неё.
+    seed: Vec<RosterEntry>,
     my_id: u16,
     nickname: String,
     identity: Arc<Identity>,
@@ -363,6 +424,8 @@ impl Engine {
         Ok(Prepared {
             socket,
             candidates: Vec::new(),
+            mine: candidates.clone(),
+            seed: Vec::new(),
             my_id: HOST_ID,
             nickname,
             identity,
@@ -404,10 +467,72 @@ impl Engine {
         Ok(Prepared {
             socket,
             candidates,
+            mine,
+            seed: Vec::new(),
             my_id: 0,
             nickname,
             identity,
             expect_host,
+            host_addr: None,
+        })
+    }
+
+    /// Возвращение в запомненную комнату.
+    ///
+    /// Кто в ней сейчас хост — неизвестно и неважно: стучимся сразу ко всем,
+    /// кого помним. Кто на месте, тот и ответит — хост рукопожатием, а
+    /// любой другой покажет на хоста. Достаточно одного уцелевшего.
+    pub fn prepare_return(
+        nickname: String,
+        shared: Arc<Mutex<Shared>>,
+        identity: Arc<Identity>,
+    ) -> Result<Prepared> {
+        let saved = last_room();
+        let mine_keys = identity.public;
+        let seed: Vec<RosterEntry> = saved
+            .iter()
+            .enumerate()
+            .map(|(i, (pk, addr, name))| (i as u16 + HOST_ID, name.clone(), *pk, Some(*addr)))
+            .collect();
+        let candidates: Vec<SocketAddr> = saved
+            .iter()
+            .filter(|(pk, _, _)| *pk != mine_keys)
+            .map(|(_, addr, _)| *addr)
+            .collect();
+        if candidates.is_empty() {
+            return Err(anyhow!("нет запомненной комнаты"));
+        }
+        let (socket, port) = bind_in_range()?;
+
+        {
+            let mut s = shared.lock().unwrap();
+            s.is_host = false;
+            s.status = "возвращаемся…".into();
+            s.log(format!("наш порт {port}"));
+            s.log(format!(
+                "стучимся ко всем, кого помним по комнате: {}",
+                saved
+                    .iter()
+                    .map(|(_, _, n)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let mine = my_candidates(&socket, port, &shared)?;
+        shared.lock().unwrap().invite = Some(encode_invite(&mine, &identity.public));
+
+        Ok(Prepared {
+            socket,
+            candidates,
+            mine,
+            seed,
+            my_id: 0,
+            nickname,
+            identity,
+            // Кто именно хост — выяснится из ответа. Проверим, что он хотя бы
+            // один из тех, кого мы в этой комнате видели.
+            expect_host: None,
             host_addr: None,
         })
     }
@@ -421,6 +546,8 @@ impl Engine {
         let Prepared {
             socket,
             candidates,
+            mine,
+            seed,
             my_id,
             nickname,
             identity,
@@ -442,6 +569,17 @@ impl Engine {
         let mesh: Direct = Arc::new(Mutex::new(HashMap::new()));
         let direct: Direct = Arc::new(Mutex::new(HashMap::new()));
         let host_seen: HostSeen = Arc::new(Mutex::new(Instant::now()));
+        let room: RoomRef = Arc::new(Room {
+            is_host: AtomicBool::new(is_host),
+            host_id: Mutex::new(HOST_ID),
+            expect_host: Mutex::new(expect_host),
+            targets: Mutex::new(candidates),
+            mine,
+            my_addr: Mutex::new(host_addr),
+            roster: Mutex::new(seed),
+            host_gone: AtomicBool::new(false),
+            joined: AtomicBool::new(is_host),
+        });
         let (chat_tx, chat_rx) = sync_channel::<String>(32);
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -474,13 +612,11 @@ impl Engine {
             locked.clone(),
             volumes.clone(),
             identity.clone(),
-            expect_host,
             mesh.clone(),
             direct.clone(),
             punch.clone(),
             host_seen.clone(),
-            host_addr,
-            is_host,
+            room.clone(),
         ));
 
         threads.push(spawn_tx(
@@ -493,7 +629,7 @@ impl Engine {
             controls.clone(),
             mesh.clone(),
             direct.clone(),
-            is_host,
+            room.clone(),
         ));
 
         threads.push(spawn_keepalive(
@@ -502,7 +638,6 @@ impl Engine {
             table,
             stop.clone(),
             nickname,
-            candidates,
             locked,
             punch.clone(),
             mixer,
@@ -511,10 +646,8 @@ impl Engine {
             chat_rx,
             identity,
             mesh,
-            direct.clone(),
             host_seen,
-            host_addr,
-            is_host,
+            room,
         ));
 
         Ok(Engine {
@@ -721,16 +854,220 @@ fn decode_peers(body: &[u8]) -> Vec<RosterEntry> {
 }
 
 /// Хост рассылает всем гостям, кто сейчас в комнате.
+/// Запоминает комнату на диск: имена, ключи и адреса всех, кто в ней был.
+///
+/// Ради этого файла всё и затевалось. Пока его не было, вернувшемуся после
+/// вылета приходилось выяснять в игровом чате, у кого теперь комната, и
+/// просить код заново. Теперь достаточно постучаться во всех разом: кто-то
+/// из них наверняка на месте, а кто именно стал хостом — разберётся
+/// приложение.
+fn remember_room(roster: &[RosterEntry]) {
+    if roster.len() < 2 {
+        return; // комната из одного себя запоминать нечего
+    }
+    let Some(path) = identity::config_file("last_room") else {
+        return;
+    };
+    let body: String = roster
+        .iter()
+        .filter_map(|(_, name, pk, addr)| {
+            let addr = (*addr)?;
+            Some(format!(
+                "{} {} {}\n",
+                identity::hex(pk),
+                addr,
+                name.replace('\n', " ")
+            ))
+        })
+        .collect();
+    if body.is_empty() {
+        return;
+    }
+    if fs::read_to_string(&path).ok().as_deref() == Some(body.as_str()) {
+        return; // ничего не поменялось — не трогаем диск
+    }
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, body);
+}
+
+/// Читает запомненную комнату: ключи, адреса и имена.
+pub fn last_room() -> Vec<([u8; 32], SocketAddr, String)> {
+    let Some(text) = identity::config_file("last_room").and_then(|p| fs::read_to_string(p).ok())
+    else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let mut it = line.splitn(3, ' ');
+            let pk = identity::parse_public(it.next()?).ok()?;
+            let addr: SocketAddr = it.next()?.parse().ok()?;
+            Some((pk, addr, it.next().unwrap_or("").to_string()))
+        })
+        .collect()
+}
+
+/// Переходит под нового хоста: перестаём быть хостом сами, если были, и
+/// начинаем знакомиться с ним заново — обычным HELLO, как при входе.
+/// Номер и имя при этом сохраняются: новый хост поднял состав из того же
+/// списка, что и мы.
+#[allow(clippy::too_many_arguments)]
+fn follow_host(
+    shared: &Arc<Mutex<Shared>>,
+    table: &Arc<Mutex<PeerTable>>,
+    room: &RoomRef,
+    locked: &Locked,
+    host_seen: &HostSeen,
+    id: u16,
+    public: [u8; 32],
+    addr: SocketAddr,
+    was_host: bool,
+) {
+    if was_host {
+        table.lock().unwrap().peers.clear();
+    }
+    room.is_host.store(false, Ordering::Relaxed);
+    room.host_gone.store(false, Ordering::Relaxed);
+    *room.host_id.lock().unwrap() = id;
+    *room.expect_host.lock().unwrap() = Some(public);
+    *room.targets.lock().unwrap() = vec![addr];
+    *locked.lock().unwrap() = None;
+    *host_seen.lock().unwrap() = Instant::now();
+
+    let mut s = shared.lock().unwrap();
+    s.is_host = false;
+    s.status = "комната у нового хоста…".into();
+    let name = s
+        .peers
+        .iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| format!("#{id}"));
+    s.log(format!("комната перешла к {name} ({addr}) — переподключаемся"));
+}
+
+/// Принимает комнату на себя. Состав известен, адреса тоже — поэтому
+/// поднимаем таблицу участников такой, какой она была у прежнего хоста,
+/// сохраняя всем номера. Подписи придётся собрать заново: чужому слову о
+/// том, кто есть кто, мы не верим даже в наследство.
+fn become_host(
+    socket: &UdpSocket,
+    room: &RoomRef,
+    table: &Arc<Mutex<PeerTable>>,
+    shared: &Arc<Mutex<Shared>>,
+    locked: &Locked,
+    nickname: &str,
+    identity: &Arc<Identity>,
+    my_id: u16,
+) {
+    let old = room.host_id();
+    let roster = room.roster.lock().unwrap().clone();
+    {
+        let mut t = table.lock().unwrap();
+        t.peers.clear();
+        let mut max = my_id;
+        for (id, name, pk, addr) in roster.iter() {
+            max = max.max(*id);
+            if *id == my_id || *id == old {
+                continue;
+            }
+            let Some(a) = addr else { continue };
+            t.peers.push(Peer {
+                id: *id,
+                name: name.clone(),
+                addr: *a,
+                last_seen: Instant::now(),
+                public: *pk,
+                challenge: identity::random_bytes::<16>(),
+                pending_addr: None,
+                verified: false,
+                joined: Instant::now(),
+            });
+        }
+        t.next_id = max.wrapping_add(1);
+    }
+
+    room.is_host.store(true, Ordering::Relaxed);
+    room.host_gone.store(false, Ordering::Relaxed);
+    *room.host_id.lock().unwrap() = my_id;
+    *room.expect_host.lock().unwrap() = None;
+    *room.my_addr.lock().unwrap() = room.mine.first().copied();
+    *locked.lock().unwrap() = None;
+
+    {
+        let mut s = shared.lock().unwrap();
+        s.is_host = true;
+        s.invite = Some(encode_invite(&room.mine, &identity.public));
+        s.status = "хост теперь вы".into();
+        s.log("прежний хост ушёл — комната перешла к вам");
+    }
+
+    // Объявляемся несколько раз: пакет легко теряется, а от этого
+    // объявления зависит, соберётся комната обратно или рассыплется.
+    let mut msg = header(T_HOST);
+    msg.extend_from_slice(&my_id.to_be_bytes());
+    msg.extend_from_slice(&identity.public);
+    msg.extend_from_slice(&encode_addr(*room.my_addr.lock().unwrap()));
+    for _ in 0..5 {
+        let addrs = table.lock().unwrap().addrs_except(None);
+        for addr in addrs {
+            let _ = socket.send_to(&msg, addr);
+        }
+        thread::sleep(Duration::from_millis(60));
+    }
+
+    let roster = broadcast_peers(socket, table, nickname, &identity.public, room);
+    shared.lock().unwrap().peers = roster.iter().map(|(i, n, _, _)| (*i, n.clone())).collect();
+}
+
+/// Кому быть новым хостом: живому участнику с наименьшим номером.
+///
+/// Никаких переговоров: у всех на руках один и тот же состав и одно и то же
+/// правило, поэтому каждый приходит к одному ответу сам. Разойтись во
+/// мнениях они всё-таки могут — если кто-то считает соседа живым, а кто-то
+/// нет; на этот случай объявившийся хост с меньшим номером перебивает
+/// объявившегося с большим.
+fn elect(room: &RoomRef, shared: &Arc<Mutex<Shared>>, my_id: u16) -> Option<RosterEntry> {
+    let gone = room.host_id();
+    let seen = shared.lock().unwrap().peer_seen.clone();
+    let mut alive: Vec<RosterEntry> = room
+        .roster
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(id, _, _, addr)| {
+            *id != gone
+                && (*id == my_id
+                    || (addr.is_some()
+                        && seen
+                            .get(id)
+                            .map(|t| t.elapsed() < ALIVE_FOR)
+                            .unwrap_or(false)))
+        })
+        .cloned()
+        .collect();
+    alive.sort_by_key(|(id, _, _, _)| *id);
+    alive.into_iter().next()
+}
+
+/// Рассылает состав комнаты и отдаёт его же вызывающему.
+///
+/// Себя вписываем под своим номером, а не под первым: хостом мог стать
+/// гость, и если бы он вдруг назвался номером один, у всех разъехались бы
+/// номера — вместе с ними громкости и заглушки, настроенные на людей.
 fn broadcast_peers(
     socket: &UdpSocket,
     table: &Arc<Mutex<PeerTable>>,
     host_name: &str,
     host_key: &[u8; 32],
-    host_addr: Option<SocketAddr>,
+    room: &RoomRef,
 ) -> Vec<RosterEntry> {
+    let me = room.host_id();
+    let my_addr = *room.my_addr.lock().unwrap();
     let t = table.lock().unwrap();
     let roster: Vec<RosterEntry> =
-        std::iter::once((HOST_ID, host_name.to_string(), *host_key, host_addr))
+        std::iter::once((me, host_name.to_string(), *host_key, my_addr))
             .chain(t.snapshot())
             .collect();
     let addrs = t.addrs_except(None);
@@ -740,6 +1077,8 @@ fn broadcast_peers(
     for addr in addrs {
         let _ = socket.send_to(&msg, addr);
     }
+    *room.roster.lock().unwrap() = roster.clone();
+    remember_room(&roster);
     roster
 }
 
@@ -755,13 +1094,11 @@ fn spawn_rx(
     locked: Locked,
     volumes: Volumes,
     identity: Arc<Identity>,
-    expect_host: Option<[u8; 32]>,
     mesh: Direct,
     direct: Direct,
     punch: PunchList,
     host_seen: HostSeen,
-    host_addr: Option<SocketAddr>,
-    is_host: bool,
+    room: RoomRef,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut known = Known::load();
@@ -782,6 +1119,9 @@ fn spawn_rx(
             }
             let kind = buf[3];
             let body = &buf[4..n];
+            // Роль может смениться посреди встречи, поэтому спрашиваем её
+            // на каждом пакете, а не запоминаем при запуске.
+            let is_host = room.is_host();
 
             // Любой разобранный пакет от хоста — признак, что связь жива.
             // Молчание дольше HOST_SILENCE означает, что путь оборвался.
@@ -853,6 +1193,9 @@ fn spawn_rx(
                     msg.extend_from_slice(&id.to_be_bytes());
                     msg.extend_from_slice(&challenge);
                     msg.extend_from_slice(&identity.public);
+                    // Свой номер: хостом мог стать гость, и вернувшемуся
+                    // неоткуда узнать, под каким номером его теперь искать.
+                    msg.extend_from_slice(&room.host_id().to_be_bytes());
                     let _ = socket.send_to(&msg, from);
                 }
 
@@ -914,9 +1257,72 @@ fn spawn_rx(
                         });
                     }
 
-                    let roster = broadcast_peers(&socket, &table, &nickname, &identity.public, host_addr);
+                    let roster = broadcast_peers(&socket, &table, &nickname, &identity.public, &room);
                     let mut sh = shared.lock().unwrap();
                     sh.peers = roster.iter().map(|(i, n, _, _)| (*i, n.clone())).collect();
+                }
+
+                T_HELLO if !is_host => {
+                    // Дверь в комнату — любой из своих. Пришедшему незачем
+                    // знать, кто сейчас хост: мы просто показываем на него.
+                    // Ради этого и затевалось: человек возвращается по
+                    // старому коду, а не выясняет в игровом чате, у кого
+                    // теперь комната.
+                    let hid = room.host_id();
+                    let roster = room.roster.lock().unwrap().clone();
+                    let Some((_, _, pk, addr)) = roster.iter().find(|(i, _, _, _)| *i == hid)
+                    else {
+                        continue;
+                    };
+                    // Адрес берём из состава, а не тот, по которому ходим
+                    // сами: наш может оказаться домашним и чужому бесполезен.
+                    let Some(addr) = addr.or(*locked.lock().unwrap()) else {
+                        continue;
+                    };
+                    let mut msg = header(T_HOST);
+                    msg.extend_from_slice(&hid.to_be_bytes());
+                    msg.extend_from_slice(pk);
+                    msg.extend_from_slice(&encode_addr(Some(addr)));
+                    let _ = socket.send_to(&msg, from);
+                }
+
+                T_HOST => {
+                    if body.len() < 40 {
+                        continue;
+                    }
+                    let id = u16::from_be_bytes([body[0], body[1]]);
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&body[2..34]);
+                    let Some(addr) = decode_addr(&body[34..40]) else {
+                        continue;
+                    };
+                    let me = *my_id.lock().unwrap();
+                    if id == me || (id == room.host_id() && !room.host_gone.load(Ordering::Relaxed))
+                    {
+                        continue;
+                    }
+                    // Объявиться хостом может кто угодно — верим только тому,
+                    // чей ключ был в известном нам составе. Сверяем именно
+                    // ключ, а не номер: в комнате, поднятой из памяти, номера
+                    // у нас свои, придуманные при чтении файла.
+                    let roster = room.roster.lock().unwrap().clone();
+                    let known = roster.iter().any(|(_, _, k, _)| *k == pk);
+                    // Либо перенаправление пришло от того, к кому мы сами
+                    // стучимся. Доверие тут ровно то же, что и к коду
+                    // приглашения: мы выбрали этот адрес, значит верим ему.
+                    let by_code = room.targets.lock().unwrap().contains(&from);
+                    if !known && !by_code {
+                        continue;
+                    }
+                    // Если хост сейчас мы, уступаем только младшему номеру:
+                    // иначе двое, объявившиеся одновременно, гоняли бы
+                    // комнату друг другу без конца.
+                    if is_host && id > me {
+                        continue;
+                    }
+                    follow_host(
+                        &shared, &table, &room, &locked, &host_seen, id, pk, addr, is_host,
+                    );
                 }
 
                 T_PEERS if !is_host => {
@@ -924,6 +1330,11 @@ fn spawn_rx(
                     if roster.is_empty() {
                         continue;
                     }
+                    // Состав нужен не только для показа: если хост уйдёт,
+                    // выбирать нового будет не у кого спросить — только по
+                    // этому списку.
+                    *room.roster.lock().unwrap() = roster.clone();
+                    remember_room(&roster);
                     // Хвосты ушедших не должны продолжать звучать.
                     let ids: Vec<u16> = roster.iter().map(|(id, _, _, _)| *id).collect();
                     mixer.retain(&ids);
@@ -964,22 +1375,42 @@ fn spawn_rx(
                 }
 
                 T_WELCOME if !is_host => {
-                    if body.len() >= 50 {
+                    if body.len() >= 52 {
                         let id = u16::from_be_bytes([body[0], body[1]]);
                         let challenge = &body[2..18];
                         let mut host_pk = [0u8; 32];
                         host_pk.copy_from_slice(&body[18..50]);
+                        let host_id = u16::from_be_bytes([body[50], body[51]]);
 
                         // Ключ из кода приглашения обязан совпасть: иначе это
                         // не тот, к кому нас звали.
-                        if let Some(expect) = expect_host {
+                        if let Some(expect) = *room.expect_host.lock().unwrap() {
                             if expect != host_pk {
                                 shared.lock().unwrap().log(
                                     "ключ хоста не совпал с кодом приглашения — не подключаемся",
                                 );
                                 continue;
                             }
+                        } else {
+                            // Возвращаемся в запомненную комнату: кто в ней
+                            // теперь хост — неизвестно, но он обязан быть
+                            // одним из тех, кого мы там видели.
+                            let ok = room
+                                .roster
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .any(|(_, _, pk, _)| *pk == host_pk);
+                            if !ok {
+                                shared
+                                    .lock()
+                                    .unwrap()
+                                    .log("на стук ответил чужой — не подключаемся");
+                                continue;
+                            }
                         }
+                        *room.host_id.lock().unwrap() = host_id;
+                        room.joined.store(true, Ordering::Relaxed);
 
                         let mut reply = header(T_AUTH);
                         reply.extend_from_slice(&id.to_be_bytes());
@@ -997,8 +1428,8 @@ fn spawn_rx(
 
                         // Хост — тоже прямой путь, причём уже проверенный:
                         // именно с этого адреса он нам и ответил.
-                        mesh.lock().unwrap().insert(HOST_ID, from);
-                        direct.lock().unwrap().insert(HOST_ID, from);
+                        mesh.lock().unwrap().insert(host_id, from);
+                        direct.lock().unwrap().insert(host_id, from);
 
                         if first {
                             let mut s = shared.lock().unwrap();
@@ -1155,6 +1586,11 @@ fn spawn_rx(
                         continue;
                     }
                     let who = u16::from_be_bytes([body[0], body[1]]);
+                    if who == room.host_id() {
+                        // Ушёл хост. Ждать двенадцать секунд тишины незачем —
+                        // он сказал об этом сам.
+                        room.host_gone.store(true, Ordering::Relaxed);
+                    }
                     mixer.remove(who);
                     let mut sh = shared.lock().unwrap();
                     sh.peers.retain(|(id, _)| *id != who);
@@ -1184,7 +1620,7 @@ fn spawn_rx(
                             .lock()
                             .unwrap()
                             .log(format!("{} отключился", gone.name));
-                        let roster = broadcast_peers(&socket, &table, &nickname, &identity.public, host_addr);
+                        let roster = broadcast_peers(&socket, &table, &nickname, &identity.public, &room);
                         shared.lock().unwrap().peers =
                             roster.iter().map(|(i, n, _, _)| (*i, n.clone())).collect();
                     }
@@ -1206,7 +1642,7 @@ fn spawn_tx(
     controls: audio::Controls,
     mesh: Direct,
     direct: Direct,
-    is_host: bool,
+    room: RoomRef,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut encoder =
@@ -1232,6 +1668,7 @@ fn spawn_tx(
             };
 
             // До того как дозвонились, кодировать нечего и некуда.
+            let is_host = room.is_host();
             let target = if is_host { None } else { *locked.lock().unwrap() };
             if !is_host && target.is_none() {
                 continue;
@@ -1287,7 +1724,6 @@ fn spawn_keepalive(
     table: Arc<Mutex<PeerTable>>,
     stop: Arc<AtomicBool>,
     nickname: String,
-    candidates: Vec<SocketAddr>,
     locked: Locked,
     punch: PunchList,
     mixer: Arc<Mixer>,
@@ -1296,10 +1732,8 @@ fn spawn_keepalive(
     chat_rx: Receiver<String>,
     identity: Arc<Identity>,
     mesh: Direct,
-    direct: Direct,
     host_seen: HostSeen,
-    host_addr: Option<SocketAddr>,
-    is_host: bool,
+    room: RoomRef,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut tick = 0u32;
@@ -1311,6 +1745,7 @@ fn spawn_keepalive(
             // Шаг короткий, чтобы отправка сообщения не ждала полсекунды;
             // всё периодическое делается раз в пять шагов.
             thread::sleep(Duration::from_millis(100));
+            let is_host = room.is_host();
 
             while let Ok(text) = chat_rx.try_recv() {
                 let mut msg = header(T_CHAT);
@@ -1354,8 +1789,17 @@ fn spawn_keepalive(
                     for addr in addrs {
                         let _ = socket.send_to(&msg, addr);
                     }
-                } else if let Some(host) = *locked.lock().unwrap() {
-                    let _ = socket.send_to(&msg, host);
+                } else {
+                    if let Some(host) = *locked.lock().unwrap() {
+                        let _ = socket.send_to(&msg, host);
+                    }
+                    // И всем, до кого добиваем напрямую. Это единственный
+                    // след жизни молчащего человека: пока хост на месте, он
+                    // виден через пересылку, а без хоста — только отсюда.
+                    // По нему же потом выбирается новый хост.
+                    for addr in mesh.lock().unwrap().values() {
+                        let _ = socket.send_to(&msg, *addr);
+                    }
                 }
             }
 
@@ -1377,7 +1821,7 @@ fn spawn_keepalive(
                     if changed {
                         shared.lock().unwrap().log("кто-то отвалился по таймауту");
                     }
-                    let roster = broadcast_peers(&socket, &table, &nickname, &identity.public, host_addr);
+                    let roster = broadcast_peers(&socket, &table, &nickname, &identity.public, &room);
                     let ids: Vec<u16> = roster.iter().map(|(id, _, _, _)| *id).collect();
                     mixer.retain(&ids);
                     shared.lock().unwrap().peers =
@@ -1386,31 +1830,62 @@ fn spawn_keepalive(
                 continue;
             }
 
-            // Сеть у людей меняется на ходу: отвалился VPN, переключился
-            // Wi-Fi — и внешний адрес стал другим. Хост об этом не знает и
-            // продолжает слать на мёртвый адрес. Поэтому, если от него давно
-            // ничего не приходило, отпускаем найденный адрес и начинаем
-            // знакомиться заново. Хост узнаёт нас по ключу и просто
-            // переставит адрес, номер и состав комнаты не поменяются.
-            if !is_host && locked.lock().unwrap().is_some() {
+            if !is_host {
                 let silent = host_seen.lock().unwrap().elapsed();
-                if silent > HOST_SILENCE {
+                let gone = room.host_gone.load(Ordering::Relaxed);
+                let me = *my_id.lock().unwrap();
+
+                if room.joined.load(Ordering::Relaxed) && (gone || silent > HOST_GONE) {
+                    // Хоста больше нет. Прямые пути между остальными живы,
+                    // разговор не прервался — не хватает только того, кто
+                    // пускает новых и рассылает состав. Выбираем его сами.
+                    match elect(&room, &shared, me) {
+                        Some((id, ..)) if id == me => {
+                            become_host(
+                                &socket, &room, &table, &shared, &locked, &nickname, &identity,
+                                me,
+                            );
+                        }
+                        Some((id, _, pk, addr)) => {
+                            if let Some(addr) = addr {
+                                follow_host(
+                                    &shared, &table, &room, &locked, &host_seen, id, pk, addr,
+                                    false,
+                                );
+                            }
+                        }
+                        None => {
+                            room.host_gone.store(false, Ordering::Relaxed);
+                            *host_seen.lock().unwrap() = Instant::now();
+                            shared
+                                .lock()
+                                .unwrap()
+                                .log("хост ушёл, а больше в комнате никого — звать некого");
+                        }
+                    }
+                } else if silent > HOST_SILENCE && locked.lock().unwrap().is_some() {
+                    // Сеть у людей меняется на ходу: отвалился VPN,
+                    // переключился Wi-Fi — и внешний адрес стал другим. Хост
+                    // об этом не знает и продолжает слать на мёртвый адрес.
+                    // Отпускаем найденный адрес и знакомимся заново: хост
+                    // узнаёт нас по ключу и просто переставит адрес.
+                    //
+                    // Прямые пути до остальных при этом не трогаем — они
+                    // ни в чём не виноваты, и звук по ним идёт как шёл.
                     *locked.lock().unwrap() = None;
-                    mesh.lock().unwrap().clear();
-                    direct.lock().unwrap().clear();
-                    mixer.retain(&[]);
                     drops += 1;
                     hinted = false;
                     tick = 1;
                     let mut s = shared.lock().unwrap();
                     s.status = "связь потеряна, переподключаемся".into();
-                    s.peers.clear();
-                    s.voice_seen.clear();
-                    s.peer_seen.clear();
-                    s.log(format!(
-                        "от хоста {} секунд тишины — восстанавливаем связь (попытка {drops})",
-                        silent.as_secs()
-                    ));
+                    // Раз в минуту, а не каждые пять секунд: если хост ушёл
+                    // насовсем, журнал не должен превращаться в ленту.
+                    if drops == 1 || drops % 12 == 0 {
+                        s.log(format!(
+                            "от хоста {} секунд тишины — восстанавливаем связь (попытка {drops})",
+                            silent.as_secs()
+                        ));
+                    }
                 }
             }
 
@@ -1425,7 +1900,7 @@ fn spawn_keepalive(
                     let mut msg = header(T_HELLO);
                     msg.extend_from_slice(&identity.public);
                     msg.extend_from_slice(nickname.as_bytes());
-                    for addr in &candidates {
+                    for addr in room.targets.lock().unwrap().iter() {
                         let _ = socket.send_to(&msg, *addr);
                     }
 
@@ -1448,7 +1923,7 @@ fn spawn_keepalive(
         let mut bye = header(T_BYE);
         bye.extend_from_slice(&my_id.lock().unwrap().to_be_bytes());
         for _ in 0..3 {
-            if is_host {
+            if room.is_host() {
                 let addrs = table.lock().unwrap().addrs_except(None);
                 for addr in addrs {
                     let _ = socket.send_to(&bye, addr);
