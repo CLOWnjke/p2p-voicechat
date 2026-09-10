@@ -134,15 +134,17 @@ pub fn level_to_pos(level: f32) -> f32 {
 }
 
 /// Сегментный индикатор уровня, как у аппаратного VU.
-pub fn meter(ui: &mut Ui, level: f32, peak: f32) {
+///
+/// Принимает уже готовые положения на шкале (0..1), а не сырой уровень:
+/// сглаживанием занимается вызывающий, иначе полоска дёргается.
+pub fn meter(ui: &mut Ui, pos: f32, peak_pos: f32) {
     const N: usize = 28;
     const GAP: f32 = 2.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 16.0), Sense::hover());
     let seg_w = (rect.width() - GAP * (N as f32 - 1.0)) / N as f32;
 
-    let lit = (level_to_pos(level) * N as f32).round() as usize;
-    let peak_pos = level_to_pos(peak);
-    let peak_i = ((peak_pos * N as f32).round() as usize).min(N - 1);
+    let lit = (pos.clamp(0.0, 1.0) * N as f32).round() as usize;
+    let peak_i = ((peak_pos.clamp(0.0, 1.0) * N as f32).round() as usize).min(N - 1);
 
     for i in 0..N {
         let x = rect.left() + i as f32 * (seg_w + GAP);
@@ -295,34 +297,74 @@ pub fn slider(
     });
 }
 
-/// Заголовок сворачиваемой секции: «+» или «−», название с разрядкой,
-/// необязательная метка справа. Кликается вся строка.
-pub fn section(ui: &mut Ui, open: &mut bool, title: &str, right: Option<(&str, Color32)>) {
-    hairline(ui, LINE);
-    let resp = ui
-        .scope(|ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                mono(ui, if *open { "−" } else { "+" }, 10.0, if *open { ACCENT } else { DIM });
-                ui.add_space(4.0);
-                mono(ui, spaced(title), 10.5, if *open { TEXT } else { TEXT_2 });
-                if let Some((r, c)) = right {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        mono(ui, spaced(r), 9.5, c);
-                    });
-                }
-            });
-            ui.add_space(4.0);
-        })
-        .response
-        .interact(Sense::click());
+/// Заголовок сворачиваемой секции: значок, название с разрядкой и
+/// необязательная метка справа. Кликается вся строка во всю ширину.
+///
+/// Возвращает состояние — тело рисуется через `show_body_unindented`,
+/// который сам анимирует раскрытие.
+pub fn section(
+    ui: &mut Ui,
+    id: &str,
+    title: &str,
+    right: Option<(&str, Color32)>,
+) -> egui::collapsing_header::CollapsingState {
+    use egui::collapsing_header::CollapsingState;
 
+    let id = ui.make_persistent_id(id);
+    let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    let openness = state.openness(ui.ctx());
+
+    hairline(ui, LINE);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
     if resp.clicked() {
-        *open = !*open;
+        state.toggle(ui);
+        state.store(ui.ctx());
     }
-    if resp.hovered() {
+    let hovered = resp.hovered();
+    if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+
+    let open = openness > 0.5;
+    let mark = if open || hovered { ACCENT } else { DIM };
+    let fg = if open || hovered { TEXT } else { TEXT_2 };
+
+    let p = ui.painter();
+    // Плюс перетекает в минус: вертикальная палочка укорачивается по мере
+    // раскрытия. Дешевле анимации значка и читается сразу.
+    let cx = rect.left() + 5.0;
+    let cy = rect.center().y;
+    let arm = 4.5;
+    p.line_segment(
+        [egui::pos2(cx - arm, cy), egui::pos2(cx + arm, cy)],
+        Stroke::new(1.0, mark),
+    );
+    let v = arm * (1.0 - openness);
+    if v > 0.2 {
+        p.line_segment(
+            [egui::pos2(cx, cy - v), egui::pos2(cx, cy + v)],
+            Stroke::new(1.0, mark),
+        );
+    }
+    p.text(
+        egui::pos2(rect.left() + 18.0, cy),
+        Align2::LEFT_CENTER,
+        spaced(title),
+        FontId::monospace(10.5),
+        fg,
+    );
+    if let Some((r, c)) = right {
+        p.text(
+            egui::pos2(rect.right(), cy),
+            Align2::RIGHT_CENTER,
+            spaced(r),
+            FontId::monospace(9.5),
+            c,
+        );
+    }
+
+    state
 }
 
 /// Схема тракта: что включено и во что это обходится по задержке.

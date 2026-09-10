@@ -560,13 +560,18 @@ fn spawn_processing(
 
                 // Уровень снимается с того, что реально уходит наружу: так на
                 // полоске видно и работу шумодава, и работу ворот.
-                let peak = pending[written_from..]
-                    .iter()
-                    .fold(0.0f32, |a, s| a.max(s.abs()));
+                // Считаем RMS, а не пик: пик скачет от каждого щелчка, и
+                // полоска превращается в стробоскоп.
+                let out = &pending[written_from..];
+                let rms = if out.is_empty() {
+                    0.0
+                } else {
+                    (out.iter().map(|s| s * s).sum::<f32>() / out.len() as f32).sqrt()
+                };
                 let prev = f32::from_bits(controls.level.load(Ordering::Relaxed));
                 controls
                     .level
-                    .store(peak.max(prev * 0.8).to_bits(), Ordering::Relaxed);
+                    .store(rms.max(prev * 0.93).to_bits(), Ordering::Relaxed);
             }
 
             while pending.len() >= FRAME {

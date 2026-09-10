@@ -26,7 +26,10 @@ use crate::audio::{self, AudioEngine, Mixer, FRAME, SAMPLE_RATE};
 use crate::nat;
 
 const MAGIC: [u8; 2] = *b"VC";
-const VERSION: u8 = 1;
+// Версия 2: в звуковой пакет добавлен байт флагов с признаком речи.
+// Со сборками версии 1 намеренно несовместимо — лучше не соединиться,
+// чем разбирать чужой формат и выдавать кашу.
+const VERSION: u8 = 2;
 
 const T_HELLO: u8 = 0x01;
 const T_WELCOME: u8 = 0x02;
@@ -70,6 +73,10 @@ pub struct Shared {
     pub is_host: bool,
     pub input_name: String,
     pub output_name: String,
+    /// Наш номер в комнате. Хост знает его сразу, гость — из WELCOME.
+    pub my_id: u16,
+    /// Когда от кого в последний раз приходил признак речи.
+    pub voice_seen: HashMap<u16, Instant>,
 }
 
 impl Shared {
@@ -186,6 +193,7 @@ impl Engine {
             s.connected = true;
             s.invite = Some(invite);
             s.status = "комната создана".into();
+            s.my_id = HOST_ID;
             s.peers = vec![(HOST_ID, nickname.clone())];
         }
 
@@ -288,6 +296,7 @@ impl Engine {
             stop.clone(),
             my_id.clone(),
             locked.clone(),
+            controls.clone(),
             is_host,
         ));
 
@@ -568,6 +577,7 @@ fn spawn_rx(
 
                         if first {
                             let mut s = shared.lock().unwrap();
+                            s.my_id = id;
                             s.connected = true;
                             s.status = "в комнате".into();
                             s.log(format!("хост ответил с {from}, наш номер {id}"));
@@ -576,10 +586,11 @@ fn spawn_rx(
                 }
 
                 T_AUDIO => {
-                    if body.len() < 4 {
+                    if body.len() < 5 {
                         continue;
                     }
                     let src = u16::from_be_bytes([body[0], body[1]]);
+                    let voiced = body[4] & 1 != 0;
 
                     // Хост пересылает пакет всем остальным как есть.
                     if is_host {
@@ -596,11 +607,17 @@ fn spawn_rx(
                         continue; // собственный голос слушать не надо
                     }
 
+                    // Признак речи от собеседника: по нему интерфейс
+                    // подсвечивает, кто сейчас говорит.
+                    if voiced {
+                        shared.lock().unwrap().voice_seen.insert(src, Instant::now());
+                    }
+
                     let dec = decoders.entry(src).or_insert_with(|| {
                         opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)
                             .expect("не удалось создать декодер Opus")
                     });
-                    if let Ok(len) = dec.decode(&body[4..], &mut pcm, false) {
+                    if let Ok(len) = dec.decode(&body[5..], &mut pcm, false) {
                         let samples: Vec<f32> = pcm[..len]
                             .iter()
                             .map(|s| *s as f32 / i16::MAX as f32)
@@ -644,6 +661,7 @@ fn spawn_tx(
     stop: Arc<AtomicBool>,
     my_id: Arc<Mutex<u16>>,
     locked: Locked,
+    controls: audio::Controls,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -681,9 +699,13 @@ fn spawn_tx(
             };
 
             let id = *my_id.lock().unwrap();
+            let voiced = audio::level_value(&controls.voice) > 0.55
+                && !controls.muted.load(Ordering::Relaxed);
+
             let mut msg = header(T_AUDIO);
             msg.extend_from_slice(&id.to_be_bytes());
             msg.extend_from_slice(&seq.to_be_bytes());
+            msg.push(if voiced { 1 } else { 0 });
             msg.extend_from_slice(&out[..len]);
             seq = seq.wrapping_add(1);
 
