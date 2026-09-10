@@ -22,7 +22,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([460.0, 720.0])
             .with_min_inner_size([400.0, 380.0])
-            .with_title("voicechat"),
+            .with_title("voicechat")
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -1282,6 +1283,47 @@ fn setup_theme(ctx: &egui::Context) {
         v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, DIMMER);
         v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
     });
+}
+
+/// Иконка окна. Рисуется прямо здесь, теми же тремя полосками, которыми
+/// в комнате помечена речь: так не нужен ни файл, ни распаковщик PNG.
+/// Файл `assets/icon.ico` — та же картинка для иконки самого exe.
+fn app_icon() -> egui::IconData {
+    const S: i32 = 256;
+    let mut rgba = vec![0u8; (S * S * 4) as usize];
+
+    let mut put = |x0: i32, y0: i32, w: i32, h: i32, c: [u8; 4]| {
+        for y in y0.max(0)..(y0 + h).min(S) {
+            for x in x0.max(0)..(x0 + w).min(S) {
+                let i = ((y * S + x) * 4) as usize;
+                rgba[i..i + 4].copy_from_slice(&c);
+            }
+        }
+    };
+
+    let bg = [10, 11, 12, 255];
+    let accent = [255, 149, 0, 255];
+    put(0, 0, S, S, bg);
+
+    // Угловые засечки — тот же приём, что и в интерфейсе.
+    let (t, l, inset) = (8, 45, 22);
+    put(inset, inset, l, t, accent);
+    put(inset, inset, t, l, accent);
+    put(S - inset - l, S - inset - t, l, t, accent);
+    put(S - inset - t, S - inset - l, t, l, accent);
+
+    // Три полоски эквалайзера.
+    let (bar_w, gap, base) = (36, 20, 197);
+    let x0 = (S - (bar_w * 3 + gap * 2)) / 2;
+    for (i, h) in [92, 150, 112].into_iter().enumerate() {
+        put(x0 + i as i32 * (bar_w + gap), base - h, bar_w, h, accent);
+    }
+
+    egui::IconData {
+        rgba,
+        width: S as u32,
+        height: S as u32,
+    }
 }
 
 fn default_nickname() -> String {
