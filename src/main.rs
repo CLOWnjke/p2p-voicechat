@@ -219,7 +219,8 @@ impl eframe::App for App {
 
 impl App {
     fn header(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
+        // Заголовок нельзя прижимать к системной рамке окна: они сливаются.
+        ui.add_space(14.0);
         egui::Frame::new()
             .inner_margin(egui::Margin {
                 left: GUTTER,
@@ -265,7 +266,7 @@ impl App {
             });
         });
             });
-        ui.add_space(10.0);
+        ui.add_space(12.0);
         hairline(ui, LINE);
     }
 
@@ -300,12 +301,7 @@ impl App {
         ui.add_space(30.0);
         micro(ui, "ИМЯ", DIM);
         ui.add_space(6.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut self.nickname)
-                .desired_width(f32::INFINITY)
-                .char_limit(24)
-                .font(egui::FontId::monospace(13.0)),
-        );
+        field(ui, &mut self.nickname, "как вас зовут", 14.0, 40.0, Some(24));
         ui.add_space(10.0);
         if button(ui, "СОЗДАТЬ КОМНАТУ", 40.0, None, Some(ACCENT), None, BG, 12.0).clicked() {
             self.begin(true);
@@ -325,17 +321,19 @@ impl App {
         ui.add_space(20.0);
         micro(ui, "КОД ПРИГЛАШЕНИЯ", DIM);
         ui.add_space(6.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut self.code_input)
-                .desired_width(f32::INFINITY)
-                .hint_text("вставьте код от друга")
-                .font(egui::FontId::monospace(12.0)),
+        field(
+            ui,
+            &mut self.code_input,
+            "вставьте код от друга",
+            13.0,
+            40.0,
+            None,
         );
         ui.add_space(10.0);
         if button(
             ui,
             "ПОДКЛЮЧИТЬСЯ",
-            36.0,
+            40.0,
             None,
             None,
             Some(DIMMER),
@@ -416,7 +414,7 @@ impl App {
                     ui.set_width(ui.available_width());
                     ui.label(
                         egui::RichText::new(&code)
-                            .size(10.5)
+                            .size(11.5)
                             .color(TEXT_2)
                             .monospace(),
                     );
@@ -433,12 +431,12 @@ impl App {
             if button(
                 ui,
                 if just { "СКОПИРОВАНО" } else { "КОПИРОВАТЬ КОД" },
-                32.0,
+                36.0,
                 None,
                 None,
                 Some(if just { ACCENT } else { DIMMER }),
                 if just { ACCENT } else { TEXT },
-                10.5,
+                11.0,
             )
             .clicked()
             {
@@ -578,7 +576,7 @@ impl App {
         if button(
             ui,
             "ВЫЙТИ ИЗ КОМНАТЫ",
-            32.0,
+            36.0,
             None,
             None,
             Some(DANGER_LINE),
@@ -633,12 +631,12 @@ impl App {
         ui.add_space(10.0);
 
         if muted {
-            if button(ui, "ВКЛЮЧИТЬ МИКРОФОН", 36.0, None, None, Some(DIMMER), TEXT, 11.0)
+            if button(ui, "ВКЛЮЧИТЬ МИКРОФОН", 40.0, None, None, Some(DIMMER), TEXT, 11.0)
                 .clicked()
             {
                 controls.muted.store(false, Ordering::Relaxed);
             }
-        } else if button(ui, "ВЫКЛЮЧИТЬ МИКРОФОН", 36.0, None, Some(ACCENT), None, BG, 11.0)
+        } else if button(ui, "ВЫКЛЮЧИТЬ МИКРОФОН", 40.0, None, Some(ACCENT), None, BG, 11.0)
             .clicked()
         {
             controls.muted.store(true, Ordering::Relaxed);
@@ -684,7 +682,7 @@ impl App {
             device_list(ui, &outs, &mut self.devices.output, "out");
 
             ui.add_space(10.0);
-            if button(ui, "ОБНОВИТЬ СПИСОК", 26.0, None, None, Some(LINE), DIM, 9.5).clicked() {
+            if button(ui, "ОБНОВИТЬ СПИСОК", 30.0, None, None, Some(LINE), DIM, 10.0).clicked() {
                 self.dev_lists = Some(audio::list_devices());
             }
             ui.add_space(12.0);
@@ -816,14 +814,9 @@ impl App {
                 .monospace(),
             );
             ui.add_space(10.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.punch_input)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("код собеседника")
-                    .font(egui::FontId::monospace(11.0)),
-            );
+            field(ui, &mut self.punch_input, "код собеседника", 12.5, 36.0, None);
             ui.add_space(8.0);
-            if button(ui, "ПРОБИТЬ", 30.0, None, None, Some(DIMMER), TEXT, 10.5).clicked() {
+            if button(ui, "ПРОБИТЬ", 36.0, None, None, Some(DIMMER), TEXT, 11.0).clicked() {
                 let code = self.punch_input.trim().to_string();
                 if let Some(engine) = &self.engine {
                     match engine.add_punch_targets(&code) {
@@ -895,7 +888,7 @@ fn footer(ui: &mut egui::Ui, items: [(&str, &str); 3]) {
 fn device_list(ui: &mut egui::Ui, items: &[String], picked: &mut Option<String>, salt: &str) {
     let mut row = |ui: &mut egui::Ui, label: &str, selected: bool| -> bool {
         let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 22.0),
+            egui::vec2(ui.available_width(), 26.0),
             egui::Sense::click(),
         );
         let hovered = resp.hovered();
@@ -920,7 +913,7 @@ fn device_list(ui: &mut egui::Ui, items: &[String], picked: &mut Option<String>,
             egui::pos2(rect.left() + 16.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::monospace(11.0),
+            egui::FontId::monospace(12.0),
             if selected { TEXT } else { TEXT_2 },
         );
         resp.clicked()

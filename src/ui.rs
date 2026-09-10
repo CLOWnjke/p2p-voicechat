@@ -81,6 +81,35 @@ pub fn corner_ticks(ui: &Ui, rect: Rect, color: Color32) {
     );
 }
 
+/// Поле ввода в высоту кнопки. Стандартное у egui вдвое ниже и с мелким
+/// шрифтом — рядом с кнопками оно выглядит вдавленной щелью.
+pub fn field(
+    ui: &mut Ui,
+    text: &mut String,
+    hint: &str,
+    size: f32,
+    height: f32,
+    limit: Option<usize>,
+) -> Response {
+    // Высота набирается вертикальными полями: у однострочного поля она
+    // складывается из высоты строки и отступов, задать её напрямую нельзя.
+    let pad = ((height - size * 1.35) / 2.0).max(4.0) as i8;
+    let mut edit = egui::TextEdit::singleline(text)
+        .desired_width(f32::INFINITY)
+        .font(FontId::monospace(size))
+        .margin(egui::Margin {
+            left: 12,
+            right: 12,
+            top: pad,
+            bottom: pad,
+        })
+        .hint_text(egui::RichText::new(hint).size(size).color(DIM).monospace());
+    if let Some(n) = limit {
+        edit = edit.char_limit(n);
+    }
+    ui.add(edit)
+}
+
 /// Прямоугольная кнопка без скруглений.
 pub fn button(
     ui: &mut Ui,
