@@ -1,0 +1,27 @@
+[package]
+name = "voicechat"
+version = "0.1.0"
+edition = "2021"
+description = "Маленький голосовой чат для друзей: один exe, без хостинга"
+
+[dependencies]
+# glow вместо wgpu: меньше зависимостей и надёжнее на старых видеодрайверах.
+# x11/wayland ничего не значат на Windows, но нужны для сборки под Linux.
+eframe = { version = "0.36", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "x11",
+    "wayland",
+] }
+cpal = "0.18"
+opus = "0.4"
+igd-next = "0.17"
+base64 = "0.23"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
