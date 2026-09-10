@@ -292,8 +292,16 @@ fn bind_in_range() -> Result<(UdpSocket, u16)> {
 }
 
 pub fn decode_invite(code: &str) -> Result<SocketAddr> {
+    let code = code.trim();
+
+    // Удобно для проверки на одной машине: адрес можно вписать как есть,
+    // например 127.0.0.1:47100.
+    if let Ok(addr) = code.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
     let raw = URL_SAFE_NO_PAD
-        .decode(code.trim())
+        .decode(code)
         .map_err(|_| anyhow!("код приглашения испорчен"))?;
     let text = String::from_utf8(raw).map_err(|_| anyhow!("код приглашения испорчен"))?;
     text.parse()
