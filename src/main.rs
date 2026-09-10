@@ -306,6 +306,9 @@ impl App {
             let muted = engine.controls.muted.load(Ordering::Relaxed);
             let mut denoise = engine.controls.denoise.load(Ordering::Relaxed);
             let mut aec = engine.controls.aec.load(Ordering::Relaxed);
+            let mut gate = engine.controls.gate.load(Ordering::Relaxed);
+            let mut sens = audio::level_value(&engine.controls.gate_sensitivity);
+            let mut floor = audio::level_value(&engine.controls.gate_floor);
 
             ui.label(egui::RichText::new(&input_name).small().weak());
             ui.add(
@@ -343,6 +346,41 @@ impl App {
                 .changed()
             {
                 engine.controls.denoise.store(denoise, Ordering::Relaxed);
+            }
+            if ui
+                .checkbox(&mut gate, "Только голос — глушить хлопки и стук")
+                .changed()
+            {
+                engine.controls.gate.store(gate, Ordering::Relaxed);
+            }
+
+            if gate {
+                ui.add_space(2.0);
+                ui.add(
+                    egui::Slider::new(&mut sens, 0.0..=1.0)
+                        .text("чувствительность")
+                        .show_value(false),
+                );
+                ui.add(
+                    egui::Slider::new(&mut floor, 0.0..=0.15)
+                        .text("порог тишины")
+                        .show_value(false),
+                );
+                engine
+                    .controls
+                    .gate_sensitivity
+                    .store(sens.to_bits(), Ordering::Relaxed);
+                engine
+                    .controls
+                    .gate_floor
+                    .store(floor.to_bits(), Ordering::Relaxed);
+                ui.label(
+                    egui::RichText::new(
+                        "меньше чувствительность — строже отбор, но можно потерять тихую речь",
+                    )
+                    .small()
+                    .weak(),
+                );
             }
             ui.label(
                 egui::RichText::new(if voice > 0.7 {

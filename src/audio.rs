@@ -31,6 +31,87 @@ pub type Reference = Arc<Mutex<VecDeque<f32>>>;
 /// Больше секунды опорного сигнала держать незачем.
 const MAX_REFERENCE: usize = SAMPLE_RATE as usize;
 
+/// На сколько кадров ворота заглядывают вперёд, прежде чем выпустить звук.
+/// Без этого начало слова срезается: пока детектор поймёт, что началась речь,
+/// первые миллисекунды уже ушли наружу закрытыми. Цена — 20 мс задержки.
+const GATE_LOOKAHEAD: usize = 2;
+/// Сколько кадров держим ворота открытыми после того, как речь пропала.
+/// 250 мс: хвосты слов и глухие согласные не должны обрубаться.
+const GATE_HANGOVER: u32 = 25;
+/// Открываемся за 5 мс, закрываемся за 40 — плавно, иначе слышны щелчки.
+const GATE_ATTACK: f32 = 1.0 / 240.0;
+const GATE_RELEASE: f32 = 1.0 / 1920.0;
+
+/// Ворота, пропускающие только голос.
+///
+/// Работают не по громкости, а по вероятности речи: хлопок в ладоши громкий,
+/// но на речь не похож, поэтому любой порог по уровню он проходит, а эти
+/// ворота — нет. Порог громкости оставлен вторым условием, чтобы отсекать
+/// тихие срабатывания детектора.
+struct VoiceGate {
+    frames: VecDeque<[f32; DENOISE_FRAME]>,
+    probs: VecDeque<f32>,
+    peaks: VecDeque<f32>,
+    hold: u32,
+    gain: f32,
+}
+
+impl VoiceGate {
+    fn new() -> Self {
+        Self {
+            frames: VecDeque::with_capacity(GATE_LOOKAHEAD + 2),
+            probs: VecDeque::with_capacity(GATE_LOOKAHEAD + 2),
+            peaks: VecDeque::with_capacity(GATE_LOOKAHEAD + 2),
+            hold: 0,
+            gain: 0.0,
+        }
+    }
+
+    /// Кладёт кадр в линию задержки и, когда та наполнилась, дописывает
+    /// в `out` самый старый кадр — уже с применённым усилением.
+    fn push(&mut self, frame: &[f32], prob: f32, open_thr: f32, floor: f32, out: &mut Vec<f32>) {
+        let mut buf = [0f32; DENOISE_FRAME];
+        buf.copy_from_slice(frame);
+        let peak = frame.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+
+        self.frames.push_back(buf);
+        self.probs.push_back(prob);
+        self.peaks.push_back(peak);
+
+        if self.frames.len() <= GATE_LOOKAHEAD {
+            return;
+        }
+
+        // Решение принимается по всему окну, включая кадры, которые ещё не
+        // прозвучали: если речь начнётся через кадр, ворота откроются заранее.
+        let voiced = self
+            .probs
+            .iter()
+            .zip(self.peaks.iter())
+            .any(|(p, pk)| *p >= open_thr && *pk >= floor);
+
+        if voiced {
+            self.hold = GATE_HANGOVER;
+        } else if self.hold > 0 {
+            self.hold -= 1;
+        }
+        let target = if self.hold > 0 { 1.0 } else { 0.0 };
+
+        let oldest = self.frames.pop_front().unwrap();
+        self.probs.pop_front();
+        self.peaks.pop_front();
+
+        for s in oldest {
+            if self.gain < target {
+                self.gain = (self.gain + GATE_ATTACK).min(target);
+            } else if self.gain > target {
+                self.gain = (self.gain - GATE_RELEASE).max(target);
+            }
+            out.push(s * self.gain);
+        }
+    }
+}
+
 /// Смешивает дорожки всех собеседников в один поток на выход.
 pub struct Mixer {
     tracks: Mutex<HashMap<u16, VecDeque<f32>>>,
@@ -136,6 +217,12 @@ pub struct Controls {
     pub muted: Arc<AtomicBool>,
     pub denoise: Arc<AtomicBool>,
     pub aec: Arc<AtomicBool>,
+    /// Пропускать только голос: хлопки, стук и щелчки не уходят наружу.
+    pub gate: Arc<AtomicBool>,
+    /// 0 — пропускать только уверенную речь, 1 — почти всё подряд.
+    pub gate_sensitivity: Level,
+    /// Нижний порог громкости: тише него не пропускаем даже похожее на речь.
+    pub gate_floor: Level,
     /// Уровень уже обработанного сигнала — так видно, что шумодав делает.
     pub level: Level,
     /// Оценка «сейчас говорят», которую RNNoise выдаёт заодно с очисткой.
@@ -148,6 +235,9 @@ impl Controls {
             muted: Arc::new(AtomicBool::new(false)),
             denoise: Arc::new(AtomicBool::new(true)),
             aec: Arc::new(AtomicBool::new(true)),
+            gate: Arc::new(AtomicBool::new(true)),
+            gate_sensitivity: Arc::new(AtomicU32::new(0.5f32.to_bits())),
+            gate_floor: Arc::new(AtomicU32::new(0.02f32.to_bits())),
             level: Arc::new(AtomicU32::new(0)),
             voice: Arc::new(AtomicU32::new(0)),
         }
@@ -242,6 +332,8 @@ fn build_input(
     let mut denoiser = DenoiseState::new();
     let mut den_in = [0f32; DENOISE_FRAME];
     let mut den_out = [0f32; DENOISE_FRAME];
+    let mut gate = VoiceGate::new();
+    let mut norm = [0f32; DENOISE_FRAME];
 
     let err_fn = |e| eprintln!("ошибка входного потока: {e}");
     let stream_cfg: cpal::StreamConfig = cfg.config();
@@ -299,15 +391,27 @@ fn build_input(
                 &den_in
             };
 
-            let mut peak = 0.0f32;
-            for s in source {
-                let v = s / i16::MAX as f32;
-                peak = peak.max(v.abs());
-                pending.push(v);
+            // Возвращаемся из шкалы i16 в привычный диапазон.
+            for (dst, src) in norm.iter_mut().zip(source) {
+                *dst = src / i16::MAX as f32;
             }
-            // Пиковый уровень с плавным спадом — иначе полоска дёргается.
-            // Уровень снимается уже после очистки, чтобы работа шумодава
-            // была видна глазами.
+
+            let written_from = pending.len();
+            if controls.gate.load(Ordering::Relaxed) {
+                let sens = f32::from_bits(controls.gate_sensitivity.load(Ordering::Relaxed));
+                // Чувствительность 0 требует почти уверенной речи, 1 — почти ничего.
+                let open_thr = 0.85 - 0.70 * sens.clamp(0.0, 1.0);
+                let floor = f32::from_bits(controls.gate_floor.load(Ordering::Relaxed));
+                gate.push(&norm, voice, open_thr, floor, &mut pending);
+            } else {
+                pending.extend_from_slice(&norm);
+            }
+
+            // Уровень снимается с того, что реально уходит наружу: так на
+            // полоске видно и работу шумодава, и работу ворот.
+            let peak = pending[written_from..]
+                .iter()
+                .fold(0.0f32, |a, s| a.max(s.abs()));
             let prev = f32::from_bits(controls.level.load(Ordering::Relaxed));
             controls
                 .level
