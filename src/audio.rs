@@ -245,9 +245,22 @@ pub struct Controls {
     pub level: Level,
     /// Оценка «сейчас говорят», которую RNNoise выдаёт заодно с очисткой.
     pub voice: Level,
+    /// Режим «говорить по кнопке».
+    pub ptt: Arc<AtomicBool>,
+    /// Кнопка сейчас нажата. Ставится глобальным опросом клавиатуры —
+    /// иначе в игре режим бесполезен, там окно не в фокусе.
+    pub ptt_down: Arc<AtomicBool>,
+    /// Какую клавишу слушать.
+    pub ptt_key: Arc<Mutex<String>>,
 }
 
 impl Controls {
+    /// Микрофон молчит: либо выключен руками, либо кнопка разговора отпущена.
+    pub fn mic_off(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+            || (self.ptt.load(Ordering::Relaxed) && !self.ptt_down.load(Ordering::Relaxed))
+    }
+
     pub fn new() -> Self {
         Self {
             muted: Arc::new(AtomicBool::new(false)),
@@ -259,6 +272,9 @@ impl Controls {
             dfn_ready: Arc::new(AtomicBool::new(false)),
             level: Arc::new(AtomicU32::new(0)),
             voice: Arc::new(AtomicU32::new(0)),
+            ptt: Arc::new(AtomicBool::new(false)),
+            ptt_down: Arc::new(AtomicBool::new(false)),
+            ptt_key: Arc::new(Mutex::new("F8".to_string())),
         }
     }
 }
@@ -267,6 +283,41 @@ impl Default for Controls {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Глобальный опрос клавиши разговора.
+///
+/// Именно опрос, а не системный хоткей: нужны и нажатие, и отпускание,
+/// причём когда окно не в фокусе. Тридцать раз в секунду — это ничто.
+///
+/// `DeviceState::new` умеет падать там, где до клавиатуры не дотянуться
+/// (нет графической сессии, не выданы права). Ловим это и просто выключаем
+/// режим, а не роняем приложение.
+pub fn spawn_ptt_watcher(controls: Controls, stop: Arc<AtomicBool>) -> JoinHandle<()> {
+    use device_query::{DeviceQuery, DeviceState};
+
+    thread::spawn(move || {
+        let device = match std::panic::catch_unwind(DeviceState::new) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("клавиатура недоступна — режим «говорить по кнопке» выключен");
+                controls.ptt.store(false, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        while !stop.load(Ordering::Relaxed) {
+            if controls.ptt.load(Ordering::Relaxed) {
+                let want = controls.ptt_key.lock().unwrap().clone();
+                let down = device
+                    .get_keys()
+                    .iter()
+                    .any(|k| format!("{k:?}").eq_ignore_ascii_case(&want));
+                controls.ptt_down.store(down, Ordering::Relaxed);
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+    })
 }
 
 /// Какие устройства выбрал человек. Пусто — берём системные по умолчанию.
@@ -619,7 +670,7 @@ fn spawn_processing(
                     .drain(..FRAME)
                     .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
                     .collect();
-                if !controls.muted.load(Ordering::Relaxed) {
+                if !controls.mic_off() {
                     let _ = frames_tx.try_send(frame);
                 }
             }

@@ -43,6 +43,7 @@ struct App {
     nickname: String,
     code_input: String,
     punch_input: String,
+    chat_input: String,
     error: Option<String>,
     engine: Option<net::Engine>,
     pending: Option<Receiver<Result<net::Prepared, String>>>,
@@ -68,6 +69,7 @@ impl App {
             nickname: default_nickname(),
             code_input: String::new(),
             punch_input: String::new(),
+            chat_input: String::new(),
             error: None,
             engine: None,
             pending: None,
@@ -149,6 +151,7 @@ impl App {
         self.engine = None; // Drop останавливает потоки и звук
         self.phase = Phase::Menu;
         self.punch_input.clear();
+        self.chat_input.clear();
         self.disp = 0.0;
         self.peak = 0.0;
         *self.shared.lock().unwrap() = net::Shared::default();
@@ -568,6 +571,7 @@ impl App {
         ui.add_space(20.0);
 
         self.chain_section(ui);
+        self.chat_section(ui, &peers);
         self.punch_section(ui);
         self.log_section(ui);
         hairline(ui, LINE);
@@ -630,11 +634,37 @@ impl App {
         meter_scale(ui);
         ui.add_space(10.0);
 
+        let ptt = controls.ptt.load(Ordering::Relaxed);
+        let holding = controls.ptt_down.load(Ordering::Relaxed);
+
         if muted {
             if button(ui, "ВКЛЮЧИТЬ МИКРОФОН", 40.0, None, None, Some(DIMMER), TEXT, 11.0)
                 .clicked()
             {
                 controls.muted.store(false, Ordering::Relaxed);
+            }
+        } else if ptt {
+            // В режиме кнопки главная строка — подсказка, а не переключатель:
+            // видно, слышат тебя сейчас или нет.
+            let key = controls.ptt_key.lock().unwrap().clone();
+            let label = if holding {
+                format!("ГОВОРИТЕ · {key}")
+            } else {
+                format!("ЗАЖМИТЕ {key}")
+            };
+            if button(
+                ui,
+                &label,
+                40.0,
+                None,
+                if holding { Some(ACCENT) } else { None },
+                if holding { None } else { Some(DIMMER) },
+                if holding { BG } else { DIM },
+                11.0,
+            )
+            .clicked()
+            {
+                controls.muted.store(true, Ordering::Relaxed);
             }
         } else if button(ui, "ВЫКЛЮЧИТЬ МИКРОФОН", 40.0, None, Some(ACCENT), None, BG, 11.0)
             .clicked()
@@ -755,6 +785,50 @@ impl App {
                 c.gate.store(gate, Ordering::Relaxed);
             }
 
+            ui.add_space(10.0);
+            hairline(ui, LINE_DIM);
+            ui.add_space(10.0);
+
+            let mut ptt = c.ptt.load(Ordering::Relaxed);
+            if toggle_row(
+                ui,
+                &mut ptt,
+                "ГОВОРИТЬ ПО КНОПКЕ",
+                "PUSH-TO-TALK",
+                "Микрофон открыт, только пока зажата\nклавиша. Работает и вне окна.",
+            ) {
+                c.ptt.store(ptt, Ordering::Relaxed);
+            }
+            if ptt {
+                ui.add_space(8.0);
+                let current = c.ptt_key.lock().unwrap().clone();
+                let mut pick: Option<String> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for key in [
+                        "F8", "F9", "F10", "CapsLock", "LControl", "LAlt", "LShift", "V", "X",
+                    ] {
+                        let on = key.eq_ignore_ascii_case(&current);
+                        if button(
+                            ui,
+                            key,
+                            24.0,
+                            Some(key.len() as f32 * 7.5 + 22.0),
+                            if on { Some(ACCENT) } else { None },
+                            if on { None } else { Some(LINE) },
+                            if on { BG } else { TEXT_2 },
+                            9.5,
+                        )
+                        .clicked()
+                        {
+                            pick = Some(key.to_string());
+                        }
+                    }
+                });
+                if let Some(k) = pick {
+                    *c.ptt_key.lock().unwrap() = k;
+                }
+            }
+
             if gate {
                 ui.add_space(18.0);
                 let mut sens = audio::level_value(&c.gate_sensitivity);
@@ -798,6 +872,76 @@ impl App {
                 });
             }
             ui.add_space(16.0);
+        });
+    }
+
+    fn chat_section(&mut self, ui: &mut egui::Ui, peers: &[(u16, String)]) {
+        let (chat, my_id) = {
+            let s = self.shared.lock().unwrap();
+            (s.chat.clone(), s.my_id)
+        };
+        let tag = chat.len().to_string();
+        let mut state = section(ui, "chat", "ЧАТ", Some((&tag, FAINT)));
+
+        state.show_body_unindented(ui, |ui| {
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical()
+                .max_height(190.0)
+                .stick_to_bottom(true)
+                .id_salt("chat")
+                .show(ui, |ui| {
+                    if chat.is_empty() {
+                        mono(ui, "пока пусто", 11.0, FAINT);
+                    }
+                    for (id, text) in &chat {
+                        let name = peers
+                            .iter()
+                            .find(|(pid, _)| pid == id)
+                            .map(|(_, n)| n.clone())
+                            .unwrap_or_else(|| format!("#{id}"));
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let (r, _) = ui.allocate_exact_size(
+                                egui::vec2(84.0, 15.0),
+                                egui::Sense::hover(),
+                            );
+                            let short: String = name.chars().take(11).collect();
+                            ui.painter().text(
+                                r.right_top() + egui::vec2(0.0, 1.0),
+                                egui::Align2::RIGHT_TOP,
+                                short,
+                                egui::FontId::monospace(11.0),
+                                if *id == my_id { ACCENT } else { DIM },
+                            );
+                            ui.label(
+                                egui::RichText::new(text)
+                                    .size(11.5)
+                                    .color(TEXT_2)
+                                    .monospace(),
+                            );
+                        });
+                        ui.add_space(3.0);
+                    }
+                });
+
+            ui.add_space(10.0);
+            let resp = field(ui, &mut self.chat_input, "написать…", 12.5, 36.0, Some(400));
+            let entered = resp.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.add_space(8.0);
+            let clicked = button(ui, "ОТПРАВИТЬ", 32.0, None, None, Some(DIMMER), TEXT, 10.5)
+                .clicked();
+
+            if entered || clicked {
+                if let Some(engine) = &self.engine {
+                    engine.send_chat(&self.chat_input);
+                }
+                self.chat_input.clear();
+                if entered {
+                    resp.request_focus();
+                }
+            }
+            ui.add_space(14.0);
         });
     }
 

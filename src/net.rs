@@ -17,7 +17,7 @@ use base64::Engine as _;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -44,6 +44,8 @@ const T_PEERS: u8 = 0x07;
 /// отдельным пакетом, потому что молчащий человек не шлёт звук вообще,
 /// и по звуковым пакетам о нём ничего не узнать.
 const T_STATE: u8 = 0x08;
+/// Строка текстового чата.
+const T_CHAT: u8 = 0x09;
 
 const HOST_ID: u16 = 1;
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -156,6 +158,8 @@ pub struct Shared {
     pub voice_seen: HashMap<u16, Instant>,
     /// У кого выключен микрофон.
     pub muted_peers: HashMap<u16, Instant>,
+    /// Текстовый чат: кто и что сказал.
+    pub chat: Vec<(u16, String)>,
 }
 
 impl Shared {
@@ -215,6 +219,22 @@ pub struct Engine {
     shared: Arc<Mutex<Shared>>,
     pub controls: audio::Controls,
     pub volumes: Volumes,
+    chat_tx: SyncSender<String>,
+}
+
+impl Engine {
+    /// Ставит строку в очередь на отправку. Уходит она из потока, который
+    /// владеет сокетом, — иначе пришлось бы тащить сокет в интерфейс.
+    pub fn send_chat(&self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let text: String = text.chars().take(400).collect();
+        let me = self.shared.lock().unwrap().my_id;
+        self.shared.lock().unwrap().chat.push((me, text.clone()));
+        let _ = self.chat_tx.try_send(text);
+    }
 }
 
 impl Engine {
@@ -343,6 +363,7 @@ impl Engine {
         }));
         let locked: Locked = Arc::new(Mutex::new(None));
         let volumes: Volumes = Arc::new(Mutex::new(HashMap::new()));
+        let (chat_tx, chat_rx) = sync_channel::<String>(32);
 
         let stop = Arc::new(AtomicBool::new(false));
         let controls = audio::Controls::new();
@@ -361,6 +382,7 @@ impl Engine {
 
         let my_id = Arc::new(Mutex::new(my_id));
         let mut threads = Vec::new();
+        threads.push(audio::spawn_ptt_watcher(controls.clone(), stop.clone()));
 
         threads.push(spawn_rx(
             socket.try_clone()?,
@@ -400,6 +422,7 @@ impl Engine {
             mixer,
             controls.clone(),
             my_id,
+            chat_rx,
             is_host,
         ));
 
@@ -411,6 +434,7 @@ impl Engine {
             shared,
             controls,
             volumes,
+            chat_tx,
         })
     }
 }
@@ -731,6 +755,30 @@ fn spawn_rx(
                     }
                 }
 
+                T_CHAT => {
+                    if body.len() < 3 {
+                        continue;
+                    }
+                    let src = u16::from_be_bytes([body[0], body[1]]);
+                    let text = String::from_utf8_lossy(&body[2..])
+                        .chars()
+                        .take(400)
+                        .collect::<String>();
+
+                    if is_host {
+                        let t = table.lock().unwrap();
+                        for addr in t.addrs_except(Some(from)) {
+                            let _ = socket.send_to(&buf[..n], addr);
+                        }
+                    }
+
+                    let mut sh = shared.lock().unwrap();
+                    sh.chat.push((src, text));
+                    if sh.chat.len() > 200 {
+                        sh.chat.remove(0);
+                    }
+                }
+
                 T_STATE => {
                     if body.len() < 3 {
                         continue;
@@ -827,8 +875,7 @@ fn spawn_tx(
             };
 
             let id = *my_id.lock().unwrap();
-            let voiced = audio::level_value(&controls.voice) > 0.55
-                && !controls.muted.load(Ordering::Relaxed);
+            let voiced = audio::level_value(&controls.voice) > 0.55 && !controls.mic_off();
 
             let mut msg = header(T_AUDIO);
             msg.extend_from_slice(&id.to_be_bytes());
@@ -867,6 +914,7 @@ fn spawn_keepalive(
     mixer: Arc<Mixer>,
     controls: audio::Controls,
     my_id: Arc<Mutex<u16>>,
+    chat_rx: Receiver<String>,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -874,7 +922,28 @@ fn spawn_keepalive(
         let mut hinted = false;
 
         while !stop.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(500));
+            // Шаг короткий, чтобы отправка сообщения не ждала полсекунды;
+            // всё периодическое делается раз в пять шагов.
+            thread::sleep(Duration::from_millis(100));
+
+            while let Ok(text) = chat_rx.try_recv() {
+                let mut msg = header(T_CHAT);
+                msg.extend_from_slice(&my_id.lock().unwrap().to_be_bytes());
+                msg.extend_from_slice(text.as_bytes());
+                if is_host {
+                    let addrs = table.lock().unwrap().addrs_except(None);
+                    for addr in addrs {
+                        let _ = socket.send_to(&msg, addr);
+                    }
+                } else if let Some(host) = *locked.lock().unwrap() {
+                    let _ = socket.send_to(&msg, host);
+                }
+            }
+
+            if tick % 5 != 0 {
+                tick += 1;
+                continue;
+            }
             tick += 1;
 
             // Стучимся навстречу по адресам, которые нам дали вручную.
@@ -940,7 +1009,7 @@ fn spawn_keepalive(
                         let _ = socket.send_to(&msg, *addr);
                     }
 
-                    if tick == 20 && !hinted {
+                    if tick >= 100 && !hinted {
                         hinted = true;
                         let mut s = shared.lock().unwrap();
                         s.status = "хост не отвечает".into();
