@@ -23,13 +23,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::audio::{self, AudioEngine, Mixer, FRAME, SAMPLE_RATE};
+use crate::identity::{self, Identity, Known};
+pub use crate::identity::Trust;
 use crate::nat;
 
 const MAGIC: [u8; 2] = *b"VC";
-// Версия 2: в звуковой пакет добавлен байт флагов с признаком речи.
-// Со сборками версии 1 намеренно несовместимо — лучше не соединиться,
-// чем разбирать чужой формат и выдавать кашу.
-const VERSION: u8 = 2;
+// Версия 3: в рукопожатие добавлены ключи и проверка подписи. Со старыми
+// сборками намеренно несовместимо — лучше не соединиться, чем разбирать
+// чужой формат и выдавать кашу.
+const VERSION: u8 = 3;
 
 const T_HELLO: u8 = 0x01;
 const T_WELCOME: u8 = 0x02;
@@ -46,6 +48,8 @@ const T_PEERS: u8 = 0x07;
 const T_STATE: u8 = 0x08;
 /// Строка текстового чата.
 const T_CHAT: u8 = 0x09;
+/// Ответ на присланную хостом случайную строку, подписанный своим ключом.
+const T_AUTH: u8 = 0x0A;
 
 const HOST_ID: u16 = 1;
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -160,6 +164,10 @@ pub struct Shared {
     pub muted_peers: HashMap<u16, Instant>,
     /// Текстовый чат: кто и что сказал.
     pub chat: Vec<(u16, String)>,
+    /// Отпечаток ключа каждого участника.
+    pub fingerprints: HashMap<u16, String>,
+    /// Кого мы встречали раньше и совпал ли ключ.
+    pub trust: HashMap<u16, Trust>,
 }
 
 impl Shared {
@@ -178,6 +186,12 @@ struct Peer {
     name: String,
     addr: SocketAddr,
     last_seen: Instant,
+    public: [u8; 32],
+    /// Случайная строка, которую мы отправили и ждём подписанной обратно.
+    challenge: [u8; 16],
+    /// Подпись сошлась: это точно владелец ключа, а не тот, кто его скопировал.
+    verified: bool,
+    joined: Instant,
 }
 
 #[derive(Default)]
@@ -195,8 +209,11 @@ impl PeerTable {
             .collect()
     }
 
-    fn snapshot(&self) -> Vec<(u16, String)> {
-        self.peers.iter().map(|p| (p.id, p.name.clone())).collect()
+    fn snapshot(&self) -> Vec<(u16, String, [u8; 32])> {
+        self.peers
+            .iter()
+            .map(|p| (p.id, p.name.clone(), p.public))
+            .collect()
     }
 }
 
@@ -209,6 +226,9 @@ pub struct Prepared {
     candidates: Vec<SocketAddr>,
     my_id: u16,
     nickname: String,
+    identity: Arc<Identity>,
+    /// Ключ, который хост обязан предъявить. Берётся из кода приглашения.
+    expect_host: Option<[u8; 32]>,
 }
 
 pub struct Engine {
@@ -263,7 +283,11 @@ impl Engine {
 }
 
 impl Engine {
-    pub fn prepare_host(nickname: String, shared: Arc<Mutex<Shared>>) -> Result<Prepared> {
+    pub fn prepare_host(
+        nickname: String,
+        shared: Arc<Mutex<Shared>>,
+        identity: Arc<Identity>,
+    ) -> Result<Prepared> {
         let (socket, port) = bind_in_range()?;
         shared
             .lock()
@@ -286,7 +310,7 @@ impl Engine {
         }
 
         let candidates = my_candidates(&socket, port, &shared)?;
-        let invite = encode_invite(&candidates);
+        let invite = encode_invite(&candidates, &identity.public);
         {
             let mut s = shared.lock().unwrap();
             s.is_host = true;
@@ -295,6 +319,7 @@ impl Engine {
             s.status = "комната создана".into();
             s.my_id = HOST_ID;
             s.peers = vec![(HOST_ID, nickname.clone())];
+            s.fingerprints.insert(HOST_ID, identity.fingerprint());
         }
 
         Ok(Prepared {
@@ -302,6 +327,8 @@ impl Engine {
             candidates: Vec::new(),
             my_id: HOST_ID,
             nickname,
+            identity,
+            expect_host: None,
         })
     }
 
@@ -309,8 +336,10 @@ impl Engine {
         code: &str,
         nickname: String,
         shared: Arc<Mutex<Shared>>,
+        identity: Arc<Identity>,
     ) -> Result<Prepared> {
         let candidates = decode_invite(code)?;
+        let expect_host = invite_key(code);
         let (socket, port) = bind_in_range()?;
 
         {
@@ -331,13 +360,15 @@ impl Engine {
         // Свои адреса нужны не только для порядка: если NAT хоста не пропускает
         // входящие, он попросит наш код и начнёт стучаться навстречу.
         let mine = my_candidates(&socket, port, &shared)?;
-        shared.lock().unwrap().invite = Some(encode_invite(&mine));
+        shared.lock().unwrap().invite = Some(encode_invite(&mine, &identity.public));
 
         Ok(Prepared {
             socket,
             candidates,
             my_id: 0,
             nickname,
+            identity,
+            expect_host,
         })
     }
 
@@ -352,6 +383,8 @@ impl Engine {
             candidates,
             my_id,
             nickname,
+            identity,
+            expect_host,
         } = prepared;
 
         socket.set_read_timeout(Some(Duration::from_millis(200)))?;
@@ -394,6 +427,8 @@ impl Engine {
             nickname.clone(),
             locked.clone(),
             volumes.clone(),
+            identity.clone(),
+            expect_host,
             is_host,
         ));
 
@@ -423,6 +458,7 @@ impl Engine {
             controls.clone(),
             my_id,
             chat_rx,
+            identity,
             is_host,
         ));
 
@@ -505,13 +541,26 @@ fn my_candidates(
     Ok(candidates)
 }
 
-fn encode_invite(candidates: &[SocketAddr]) -> String {
-    let text = candidates
-        .iter()
-        .map(|a| a.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
+fn encode_invite(candidates: &[SocketAddr], public: &[u8; 32]) -> String {
+    let text = format!(
+        "{}|{}",
+        candidates
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        identity::hex(public)
+    );
     URL_SAFE_NO_PAD.encode(text)
+}
+
+/// Ключ хоста из кода приглашения. По нему гость убеждается, что попал
+/// туда, куда его звали, а не к тому, кто перехватил адрес.
+pub fn invite_key(code: &str) -> Option<[u8; 32]> {
+    let raw = URL_SAFE_NO_PAD.decode(code.trim()).ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    let (_, key) = text.split_once('|')?;
+    identity::parse_public(key).ok()
 }
 
 pub fn decode_invite(code: &str) -> Result<Vec<SocketAddr>> {
@@ -531,6 +580,8 @@ pub fn decode_invite(code: &str) -> Result<Vec<SocketAddr>> {
         .decode(code)
         .map_err(|_| anyhow!("код приглашения испорчен"))?;
     let text = String::from_utf8(raw).map_err(|_| anyhow!("код приглашения испорчен"))?;
+    // Ключ хоста живёт в том же коде после разделителя.
+    let text = text.split('|').next().unwrap_or(&text).to_string();
 
     let list: Vec<SocketAddr> = text
         .split(',')
@@ -547,20 +598,21 @@ fn header(kind: u8) -> Vec<u8> {
 }
 
 /// Состав комнаты в пакете: [кол-во] и дальше [id u16][длина имени][имя].
-fn encode_peers(roster: &[(u16, String)]) -> Vec<u8> {
+fn encode_peers(roster: &[(u16, String, [u8; 32])]) -> Vec<u8> {
     let mut msg = header(T_PEERS);
     msg.push(roster.len().min(255) as u8);
-    for (id, name) in roster.iter().take(255) {
+    for (id, name, pk) in roster.iter().take(255) {
         let bytes = name.as_bytes();
         let len = bytes.len().min(64);
         msg.extend_from_slice(&id.to_be_bytes());
+        msg.extend_from_slice(pk);
         msg.push(len as u8);
         msg.extend_from_slice(&bytes[..len]);
     }
     msg
 }
 
-fn decode_peers(body: &[u8]) -> Vec<(u16, String)> {
+fn decode_peers(body: &[u8]) -> Vec<(u16, String, [u8; 32])> {
     let mut out = Vec::new();
     if body.is_empty() {
         return out;
@@ -568,27 +620,39 @@ fn decode_peers(body: &[u8]) -> Vec<(u16, String)> {
     let count = body[0] as usize;
     let mut i = 1usize;
     for _ in 0..count {
-        if i + 3 > body.len() {
+        if i + 35 > body.len() {
             break;
         }
         let id = u16::from_be_bytes([body[i], body[i + 1]]);
-        let len = body[i + 2] as usize;
-        i += 3;
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&body[i + 2..i + 34]);
+        let len = body[i + 34] as usize;
+        i += 35;
         if i + len > body.len() {
             break;
         }
-        out.push((id, String::from_utf8_lossy(&body[i..i + len]).to_string()));
+        out.push((
+            id,
+            String::from_utf8_lossy(&body[i..i + len]).to_string(),
+            pk,
+        ));
         i += len;
     }
     out
 }
 
 /// Хост рассылает всем гостям, кто сейчас в комнате.
-fn broadcast_peers(socket: &UdpSocket, table: &Arc<Mutex<PeerTable>>, host_name: &str) -> Vec<(u16, String)> {
+fn broadcast_peers(
+    socket: &UdpSocket,
+    table: &Arc<Mutex<PeerTable>>,
+    host_name: &str,
+    host_key: &[u8; 32],
+) -> Vec<(u16, String, [u8; 32])> {
     let t = table.lock().unwrap();
-    let roster: Vec<(u16, String)> = std::iter::once((HOST_ID, host_name.to_string()))
-        .chain(t.snapshot())
-        .collect();
+    let roster: Vec<(u16, String, [u8; 32])> =
+        std::iter::once((HOST_ID, host_name.to_string(), *host_key))
+            .chain(t.snapshot())
+            .collect();
     let addrs = t.addrs_except(None);
     drop(t);
 
@@ -610,9 +674,12 @@ fn spawn_rx(
     nickname: String,
     locked: Locked,
     volumes: Volumes,
+    identity: Arc<Identity>,
+    expect_host: Option<[u8; 32]>,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let mut known = Known::load();
         let mut streams: HashMap<u16, Incoming> = HashMap::new();
         let mut pcm = vec![0i16; FRAME * 2];
         let mut decoded: Vec<f32> = Vec::with_capacity(FRAME * 4);
@@ -631,41 +698,98 @@ fn spawn_rx(
 
             match kind {
                 T_HELLO if is_host => {
-                    let name = String::from_utf8_lossy(body)
+                    if body.len() < 33 {
+                        continue;
+                    }
+                    let mut public = [0u8; 32];
+                    public.copy_from_slice(&body[..32]);
+                    let name = String::from_utf8_lossy(&body[32..])
                         .chars()
                         .take(24)
                         .collect::<String>();
+
                     let mut t = table.lock().unwrap();
-                    let id = match t.peers.iter_mut().find(|p| p.addr == from) {
+                    let (id, challenge) = match t.peers.iter_mut().find(|p| p.addr == from) {
                         Some(p) => {
                             p.last_seen = Instant::now();
-                            p.id
+                            (p.id, p.challenge)
                         }
                         None => {
                             let id = t.next_id;
                             t.next_id += 1;
+                            // Случайная строка, которую гость должен подписать.
+                            // Без неё открытый ключ можно было бы просто скопировать.
+                            let challenge = identity::random_bytes::<16>();
                             t.peers.push(Peer {
                                 id,
                                 name: name.clone(),
                                 addr: from,
                                 last_seen: Instant::now(),
+                                public,
+                                challenge,
+                                verified: false,
+                                joined: Instant::now(),
                             });
                             shared
                                 .lock()
                                 .unwrap()
-                                .log(format!("подключился {name} ({from})"));
-                            id
+                                .log(format!("подключается {name} ({from})"));
+                            (id, challenge)
                         }
                     };
                     drop(t);
 
                     let mut msg = header(T_WELCOME);
                     msg.extend_from_slice(&id.to_be_bytes());
+                    msg.extend_from_slice(&challenge);
+                    msg.extend_from_slice(&identity.public);
                     let _ = socket.send_to(&msg, from);
+                }
 
-                    // Все узнают, кто теперь в комнате.
-                    let roster = broadcast_peers(&socket, &table, &nickname);
-                    shared.lock().unwrap().peers = roster;
+                T_AUTH if is_host => {
+                    if body.len() < 66 {
+                        continue;
+                    }
+                    let id = u16::from_be_bytes([body[0], body[1]]);
+                    let mut sig = [0u8; 64];
+                    sig.copy_from_slice(&body[2..66]);
+
+                    let mut t = table.lock().unwrap();
+                    let Some(p) = t.peers.iter_mut().find(|p| p.id == id && p.addr == from) else {
+                        continue;
+                    };
+                    if p.verified {
+                        continue;
+                    }
+                    if !identity::verify(&p.public, &p.challenge, &sig) {
+                        let name = p.name.clone();
+                        drop(t);
+                        shared
+                            .lock()
+                            .unwrap()
+                            .log(format!("подпись {name} не сошлась — не пускаем"));
+                        continue;
+                    }
+                    p.verified = true;
+                    let (name, fp) = (p.name.clone(), identity::fingerprint(&p.public));
+                    drop(t);
+
+                    let trust = known.check(&name, &fp);
+                    known.remember(&name, &fp);
+                    {
+                        let mut sh = shared.lock().unwrap();
+                        sh.fingerprints.insert(id, fp.clone());
+                        sh.trust.insert(id, trust);
+                        sh.log(match trust {
+                            Trust::Changed => format!("ВНИМАНИЕ: у {name} другой ключ ({fp})"),
+                            Trust::New => format!("{name} подключился, ключ {fp} (впервые)"),
+                            Trust::Known => format!("{name} подключился, ключ {fp}"),
+                        });
+                    }
+
+                    let roster = broadcast_peers(&socket, &table, &nickname, &identity.public);
+                    let mut sh = shared.lock().unwrap();
+                    sh.peers = roster.iter().map(|(i, n, _)| (*i, n.clone())).collect();
                 }
 
                 T_PEERS if !is_host => {
@@ -674,14 +798,48 @@ fn spawn_rx(
                         continue;
                     }
                     // Хвосты ушедших не должны продолжать звучать.
-                    let ids: Vec<u16> = roster.iter().map(|(id, _)| *id).collect();
+                    let ids: Vec<u16> = roster.iter().map(|(id, _, _)| *id).collect();
                     mixer.retain(&ids);
-                    shared.lock().unwrap().peers = roster;
+
+                    let mut sh = shared.lock().unwrap();
+                    sh.peers = roster.iter().map(|(i, n, _)| (*i, n.clone())).collect();
+                    for (id, name, pk) in &roster {
+                        let fp = identity::fingerprint(pk);
+                        let trust = known.check(name, &fp);
+                        if !sh.fingerprints.contains_key(id) {
+                            if trust == Trust::Changed {
+                                sh.log(format!("ВНИМАНИЕ: у {name} другой ключ ({fp})"));
+                            }
+                            known.remember(name, &fp);
+                        }
+                        sh.fingerprints.insert(*id, fp);
+                        sh.trust.insert(*id, trust);
+                    }
                 }
 
                 T_WELCOME if !is_host => {
-                    if body.len() >= 2 {
+                    if body.len() >= 50 {
                         let id = u16::from_be_bytes([body[0], body[1]]);
+                        let challenge = &body[2..18];
+                        let mut host_pk = [0u8; 32];
+                        host_pk.copy_from_slice(&body[18..50]);
+
+                        // Ключ из кода приглашения обязан совпасть: иначе это
+                        // не тот, к кому нас звали.
+                        if let Some(expect) = expect_host {
+                            if expect != host_pk {
+                                shared.lock().unwrap().log(
+                                    "ключ хоста не совпал с кодом приглашения — не подключаемся",
+                                );
+                                continue;
+                            }
+                        }
+
+                        let mut reply = header(T_AUTH);
+                        reply.extend_from_slice(&id.to_be_bytes());
+                        reply.extend_from_slice(&identity.sign(challenge));
+                        let _ = socket.send_to(&reply, from);
+
                         *my_id.lock().unwrap() = id;
                         // Запоминаем именно тот адрес, откуда пришёл ответ:
                         // остальные кандидаты больше не нужны.
@@ -696,6 +854,7 @@ fn spawn_rx(
                             s.connected = true;
                             s.status = "в комнате".into();
                             s.log(format!("хост ответил с {from}, наш номер {id}"));
+                            s.log(format!("ключ хоста {}", identity::fingerprint(&host_pk)));
                         }
                     }
                 }
@@ -819,8 +978,9 @@ fn spawn_rx(
                             .lock()
                             .unwrap()
                             .log(format!("{} отключился", gone.name));
-                        let roster = broadcast_peers(&socket, &table, &nickname);
-                        shared.lock().unwrap().peers = roster;
+                        let roster = broadcast_peers(&socket, &table, &nickname, &identity.public);
+                        shared.lock().unwrap().peers =
+                            roster.iter().map(|(i, n, _)| (*i, n.clone())).collect();
                     }
                 }
 
@@ -915,6 +1075,7 @@ fn spawn_keepalive(
     controls: audio::Controls,
     my_id: Arc<Mutex<u16>>,
     chat_rx: Receiver<String>,
+    identity: Arc<Identity>,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -977,7 +1138,11 @@ fn spawn_keepalive(
                 // Хост выкидывает тех, кто замолчал.
                 let mut t = table.lock().unwrap();
                 let before = t.peers.len();
-                t.peers.retain(|p| p.last_seen.elapsed() < PEER_TIMEOUT);
+                // Не подтвердивший подпись за десять секунд не входит.
+                t.peers.retain(|p| {
+                    p.last_seen.elapsed() < PEER_TIMEOUT
+                        && (p.verified || p.joined.elapsed() < Duration::from_secs(10))
+                });
                 let changed = t.peers.len() != before;
                 drop(t);
 
@@ -987,10 +1152,11 @@ fn spawn_keepalive(
                     if changed {
                         shared.lock().unwrap().log("кто-то отвалился по таймауту");
                     }
-                    let roster = broadcast_peers(&socket, &table, &nickname);
-                    let ids: Vec<u16> = roster.iter().map(|(id, _)| *id).collect();
+                    let roster = broadcast_peers(&socket, &table, &nickname, &identity.public);
+                    let ids: Vec<u16> = roster.iter().map(|(id, _, _)| *id).collect();
                     mixer.retain(&ids);
-                    shared.lock().unwrap().peers = roster;
+                    shared.lock().unwrap().peers =
+                        roster.iter().map(|(i, n, _)| (*i, n.clone())).collect();
                 }
                 continue;
             }
@@ -1004,6 +1170,7 @@ fn spawn_keepalive(
                     // Повторяем, потому что первые пакеты часто уходят в никуда,
                     // пока NAT не откроет путь.
                     let mut msg = header(T_HELLO);
+                    msg.extend_from_slice(&identity.public);
                     msg.extend_from_slice(nickname.as_bytes());
                     for addr in &candidates {
                         let _ = socket.send_to(&msg, *addr);

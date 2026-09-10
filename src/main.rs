@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod identity;
 mod nat;
 mod net;
 mod ui;
@@ -58,6 +59,8 @@ struct App {
     /// бесплатный, а делать его каждый кадр отрисовки — верный способ
     /// подвесить окно.
     dev_lists: Option<(Vec<String>, Vec<String>)>,
+    /// Своя пара ключей: имя — это просто строка, а ключ подделать нельзя.
+    identity: Arc<identity::Identity>,
 }
 
 impl App {
@@ -79,6 +82,7 @@ impl App {
             last_frame: Instant::now(),
             devices: audio::DevicePrefs::default(),
             dev_lists: None,
+            identity: Arc::new(identity::Identity::load_or_create()),
         }
     }
 
@@ -99,12 +103,13 @@ impl App {
         let (tx, rx) = channel();
         let shared = self.shared.clone();
         let code = self.code_input.trim().to_string();
+        let id = self.identity.clone();
 
         std::thread::spawn(move || {
             let result = if host {
-                net::Engine::prepare_host(nickname, shared)
+                net::Engine::prepare_host(nickname, shared, id)
             } else {
-                net::Engine::prepare_join(&code, nickname, shared)
+                net::Engine::prepare_join(&code, nickname, shared, id)
             };
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
@@ -364,7 +369,7 @@ impl App {
     }
 
     fn ui_active(&mut self, ui: &mut egui::Ui) {
-        let (invite, upnp, peers, status, is_host, my_id, voice_seen, muted_peers) = {
+        let (invite, upnp, peers, status, is_host, my_id, voice_seen, muted_peers, prints, trust) = {
             let s = self.shared.lock().unwrap();
             (
                 s.invite.clone(),
@@ -375,6 +380,8 @@ impl App {
                 s.my_id,
                 s.voice_seen.clone(),
                 s.muted_peers.keys().copied().collect::<Vec<_>>(),
+                s.fingerprints.clone(),
+                s.trust.clone(),
             )
         };
 
@@ -446,6 +453,20 @@ impl App {
                 ui.ctx().copy_text(code.clone());
                 self.copied_at = Some(Instant::now());
             }
+
+            ui.add_space(9.0);
+            let (r, resp) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
+            ui.painter().text(
+                r.left_center(),
+                egui::Align2::LEFT_CENTER,
+                spaced(&format!("ВАШ КЛЮЧ · {}", self.identity.fingerprint())),
+                egui::FontId::monospace(9.5),
+                FAINT,
+            );
+            resp.on_hover_text(
+                "Отпечаток вашего ключа. Он создаётся один раз и хранится на этом компьютере; собеседники узнают вас именно по нему, а не по имени.",
+            );
 
             if let Some(note) = &upnp {
                 let ok = note.contains("пробросил порт:");
@@ -541,9 +562,42 @@ impl App {
                 };
                 mono(ui, name.clone(), 12.5, name_color);
 
+                // Ключ подделать нельзя, а имя можно: если под знакомым именем
+                // пришёл другой ключ, об этом надо сказать вслух.
+                if trust.get(id) == Some(&net::Trust::Changed) {
+                    ui.add_space(2.0);
+                    let (r, resp) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "!",
+                        egui::FontId::monospace(12.0),
+                        DANGER,
+                    );
+                    resp.on_hover_text(
+                        "Под этим именем раньше приходил другой ключ. Либо человек переустановил приложение, либо это не он.",
+                    );
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    mono(ui, format!("#{id}"), 10.0, FAINT);
-                    ui.add_space(8.0);
+                    let (r, resp) =
+                        ui.allocate_exact_size(egui::vec2(58.0, 12.0), egui::Sense::hover());
+                    ui.painter().text(
+                        r.right_center(),
+                        egui::Align2::RIGHT_CENTER,
+                        prints.get(id).cloned().unwrap_or_else(|| "····".into()),
+                        egui::FontId::monospace(9.5),
+                        if trust.get(id) == Some(&net::Trust::Changed) {
+                            DANGER
+                        } else {
+                            FAINT
+                        },
+                    );
+                    resp.on_hover_text(
+                        "Отпечаток ключа. Он у человека один и тот же от встречи к встрече — по нему и опознают, что это правда он.",
+                    );
+                    ui.add_space(6.0);
                     if me {
                         mono(ui, spaced("ВЫ"), 9.5, ACCENT);
                     } else if let Some(engine) = &self.engine {
