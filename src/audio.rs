@@ -38,8 +38,9 @@ const MAX_REFERENCE: usize = SAMPLE_RATE as usize;
 
 /// На сколько кадров ворота заглядывают вперёд, прежде чем выпустить звук.
 /// Без этого начало слова срезается: пока детектор поймёт, что началась речь,
-/// первые миллисекунды уже ушли наружу закрытыми. Цена — 20 мс задержки.
-const GATE_LOOKAHEAD: usize = 2;
+/// первые миллисекунды уже ушли наружу закрытыми. Цена — 40 мс задержки,
+/// и они добавляются только при включённых воротах.
+const GATE_LOOKAHEAD: usize = 4;
 /// Сколько кадров держим ворота открытыми после того, как речь пропала.
 /// 250 мс: хвосты слов и глухие согласные не должны обрубаться.
 const GATE_HANGOVER: u32 = 25;
@@ -74,10 +75,20 @@ impl VoiceGate {
 
     /// Кладёт кадр в линию задержки и, когда та наполнилась, дописывает
     /// в `out` самый старый кадр — уже с применённым усилением.
-    fn push(&mut self, frame: &[f32], prob: f32, open_thr: f32, floor: f32, out: &mut Vec<f32>) {
+    /// `prob` и `peak` берутся с сигнала **до** шумодава: после него тишина
+    /// становится идеальным нулём, и по нему невозможно понять, что речь
+    /// вот-вот начнётся.
+    fn push(
+        &mut self,
+        frame: &[f32],
+        prob: f32,
+        peak: f32,
+        open_thr: f32,
+        floor: f32,
+        out: &mut Vec<f32>,
+    ) {
         let mut buf = [0f32; DENOISE_FRAME];
         buf.copy_from_slice(frame);
-        let peak = frame.iter().fold(0.0f32, |a, s| a.max(s.abs()));
 
         self.frames.push_back(buf);
         self.probs.push_back(prob);
@@ -422,7 +433,14 @@ fn spawn_processing(
 
         // Загрузка модели занимает около полусекунды. Она идёт здесь, в фоне,
         // чтобы окно не подвисало при входе в комнату.
-        let mut dfn = match DfTract::new(DfParams::default(), &RuntimeParams::default()) {
+        let mut dfn_params = RuntimeParams::default();
+        // По умолчанию при SNR ниже -10 дБ модель не приглушает, а обнуляет
+        // выход полностью. Оценка SNR отстаёт, поэтому под обнуление попадают
+        // и первые кадры речи — начало фразы пропадает. Опускаем порог, чтобы
+        // модель всегда хотя бы фильтровала, а не выключалась.
+        dfn_params.min_db_thresh = -20.0;
+
+        let mut dfn = match DfTract::new(DfParams::default(), &dfn_params) {
             Ok(d) if d.hop_size == DENOISE_FRAME => {
                 controls.dfn_ready.store(true, Ordering::Relaxed);
                 Some(d)
@@ -496,25 +514,25 @@ fn spawn_processing(
                     *dst = src;
                 }
 
+                // Детектор речи работает по сигналу ДО шумодава. Это важно:
+                // после шумодава тишина — идеальный ноль, по которому нельзя
+                // понять, что речь начинается, и ворота открываются с
+                // опозданием на пол-секунды.
+                // RNNoise ждёт шкалу i16, а не диапазон от -1 до 1 — на этом
+                // обычно и спотыкаются при интеграции.
+                let mut dirty_peak = 0.0f32;
+                for (dst, src) in vad_in.iter_mut().zip(dfn_in.as_slice().unwrap()) {
+                    dirty_peak = dirty_peak.max(src.abs());
+                    *dst = src * i16::MAX as f32;
+                }
+                let voice = rnn.process_frame(&mut vad_out, &vad_in);
+                controls.voice.store(voice.to_bits(), Ordering::Relaxed);
+
                 // DeepFilterNet работает в привычном диапазоне от -1 до 1.
                 let dfn_ok = match dfn.as_mut() {
                     Some(d) => d.process(dfn_in.view(), dfn_out.view_mut()).is_ok(),
                     None => false,
                 };
-
-                // RNNoise ждёт шкалу i16, а не диапазон от -1 до 1 — на этом
-                // обычно и спотыкаются при интеграции. Считаем его всегда:
-                // нужна вероятность речи, и брать её лучше с чистого сигнала.
-                let for_vad: &[f32] = if dfn_ok {
-                    dfn_out.as_slice().unwrap()
-                } else {
-                    dfn_in.as_slice().unwrap()
-                };
-                for (dst, src) in vad_in.iter_mut().zip(for_vad) {
-                    *dst = src * i16::MAX as f32;
-                }
-                let voice = rnn.process_frame(&mut vad_out, &vad_in);
-                controls.voice.store(voice.to_bits(), Ordering::Relaxed);
 
                 if controls.denoise.load(Ordering::Relaxed) {
                     if dfn_ok {
@@ -535,7 +553,7 @@ fn spawn_processing(
                     // Чувствительность 0 требует почти уверенной речи, 1 — почти ничего.
                     let open_thr = 0.85 - 0.70 * sens.clamp(0.0, 1.0);
                     let floor = f32::from_bits(controls.gate_floor.load(Ordering::Relaxed));
-                    gate.push(&norm, voice, open_thr, floor, &mut pending);
+                    gate.push(&norm, voice, dirty_peak, open_thr, floor, &mut pending);
                 } else {
                     pending.extend_from_slice(&norm);
                 }

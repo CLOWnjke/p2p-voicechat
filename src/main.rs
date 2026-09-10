@@ -11,11 +11,18 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Акцент интерфейса. Спокойный бирюзовый: он читается и на тёмном фоне,
+/// и рядом с красным «выйти», не превращая окно в светофор.
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(64, 178, 160);
+const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(44, 122, 110);
+const DANGER: egui::Color32 = egui::Color32::from_rgb(206, 96, 96);
+const SURFACE: egui::Color32 = egui::Color32::from_rgb(32, 37, 40);
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([470.0, 600.0])
-            .with_min_inner_size([420.0, 460.0])
+            .with_inner_size([460.0, 720.0])
+            .with_min_inner_size([380.0, 320.0])
             .with_title("Голосовой чат"),
         ..Default::default()
     };
@@ -41,17 +48,12 @@ struct App {
     error: Option<String>,
     engine: Option<net::Engine>,
     pending: Option<Receiver<Result<net::Prepared, String>>>,
-    show_log: bool,
+    copied_at: Option<std::time::Instant>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        cc.egui_ctx.all_styles_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(8.0, 8.0);
-            s.spacing.button_padding = egui::vec2(12.0, 7.0);
-        });
-
+        setup_theme(&cc.egui_ctx);
         Self {
             shared: Arc::new(Mutex::new(net::Shared::default())),
             phase: Phase::Menu,
@@ -61,7 +63,7 @@ impl App {
             error: None,
             engine: None,
             pending: None,
-            show_log: false,
+            copied_at: None,
         }
     }
 
@@ -95,9 +97,9 @@ impl App {
         self.pending = Some(rx);
         self.phase = Phase::Connecting(
             if host {
-                "Открываем порт и спрашиваем внешний адрес…"
+                "Открываем порт и спрашиваем внешний адрес"
             } else {
-                "Ищем хоста…"
+                "Ищем хоста"
             }
             .into(),
         );
@@ -129,6 +131,7 @@ impl App {
     fn leave(&mut self) {
         self.engine = None; // Drop останавливает потоки и звук
         self.phase = Phase::Menu;
+        self.punch_input.clear();
         *self.shared.lock().unwrap() = net::Shared::default();
     }
 }
@@ -140,77 +143,115 @@ impl eframe::App for App {
         ui.ctx().request_repaint_after(Duration::from_millis(80));
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.heading("Голосовой чат");
-            ui.label(
-                egui::RichText::new("хост держит комнату у себя, сервера нет")
-                    .small()
-                    .weak(),
-            );
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(10.0);
+            // Прокрутка обязательна: в маленьком окне настройки не помещаются,
+            // а заставлять человека растягивать окно — плохая идея.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    self.header(ui);
+                    ui.add_space(14.0);
 
-            match &self.phase {
-                Phase::Menu => self.ui_menu(ui),
-                Phase::Connecting(msg) => {
-                    let msg = msg.clone();
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(msg);
-                    });
-                    ui.add_space(8.0);
-                    self.ui_log(ui);
-                }
-                Phase::Active => self.ui_active(ui),
-            }
+                    match &self.phase {
+                        Phase::Menu => self.ui_menu(ui),
+                        Phase::Connecting(msg) => {
+                            let msg = msg.clone();
+                            self.ui_connecting(ui, &msg);
+                        }
+                        Phase::Active => self.ui_active(ui),
+                    }
 
-            if let Some(err) = &self.error {
-                ui.add_space(10.0);
-                ui.colored_label(egui::Color32::from_rgb(230, 110, 110), err);
-            }
+                    if let Some(err) = self.error.clone() {
+                        ui.add_space(12.0);
+                        card(ui, DANGER.gamma_multiply(0.18), |ui| {
+                            ui.colored_label(DANGER, err);
+                        });
+                    }
+                    ui.add_space(16.0);
+                });
         });
     }
 }
 
 impl App {
+    fn header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Голосовой чат").size(21.0).strong());
+            let connected = self.shared.lock().unwrap().connected;
+            if matches!(self.phase, Phase::Active) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    pill(
+                        ui,
+                        if connected { "в комнате" } else { "соединяемся" },
+                        if connected { ACCENT } else { egui::Color32::GRAY },
+                    );
+                });
+            }
+        });
+        ui.label(
+            egui::RichText::new("комната живёт на компьютере хоста, сервера нет")
+                .size(11.5)
+                .color(egui::Color32::from_gray(120)),
+        );
+    }
+
+    fn ui_connecting(&mut self, ui: &mut egui::Ui, msg: &str) {
+        card(ui, SURFACE, |ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.add_space(4.0);
+                ui.label(msg);
+            });
+        });
+        ui.add_space(10.0);
+        self.log_section(ui);
+    }
+
     fn ui_menu(&mut self, ui: &mut egui::Ui) {
-        ui.label("Ваше имя");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.nickname)
-                .desired_width(f32::INFINITY)
-                .char_limit(24),
-        );
+        card(ui, SURFACE, |ui| {
+            ui.label(egui::RichText::new("Ваше имя").size(12.5).weak());
+            ui.add_space(4.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.nickname)
+                    .desired_width(f32::INFINITY)
+                    .char_limit(24),
+            );
+            ui.add_space(12.0);
+            if primary_button(ui, "Создать комнату").clicked() {
+                self.begin(true);
+            }
+        });
 
-        ui.add_space(16.0);
-        if ui
-            .add_sized([ui.available_width(), 38.0], egui::Button::new("Создать комнату"))
-            .clicked()
-        {
-            self.begin(true);
-        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("или присоединиться").size(11.5).weak());
+        });
+        ui.add_space(6.0);
 
-        ui.add_space(20.0);
-        ui.separator();
-        ui.add_space(14.0);
-
-        ui.label("Код приглашения от друга");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.code_input)
-                .desired_width(f32::INFINITY)
-                .hint_text("вставьте сюда"),
-        );
-        ui.add_space(8.0);
-        if ui
-            .add_sized([ui.available_width(), 38.0], egui::Button::new("Подключиться"))
-            .clicked()
-        {
-            self.begin(false);
-        }
+        card(ui, SURFACE, |ui| {
+            ui.label(egui::RichText::new("Код приглашения").size(12.5).weak());
+            ui.add_space(4.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.code_input)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("вставьте код от друга"),
+            );
+            ui.add_space(10.0);
+            if ui
+                .add_sized(
+                    [ui.available_width(), 34.0],
+                    egui::Button::new("Подключиться"),
+                )
+                .clicked()
+            {
+                self.begin(false);
+            }
+        });
     }
 
     fn ui_active(&mut self, ui: &mut egui::Ui) {
-        let (invite, upnp, peers, status, is_host, input_name) = {
+        let (invite, upnp, peers, status, is_host) = {
             let s = self.shared.lock().unwrap();
             (
                 s.invite.clone(),
@@ -218,110 +259,142 @@ impl App {
                 s.peers.clone(),
                 s.status.clone(),
                 s.is_host,
-                s.input_name.clone(),
             )
         };
 
+        // --- код приглашения ---
         if let Some(code) = invite {
-            ui.label(if is_host {
-                "Ваш код — отправьте его друзьям"
-            } else {
-                "Ваш код — отправьте его хосту"
+            card(ui, SURFACE, |ui| {
+                ui.label(
+                    egui::RichText::new(if is_host {
+                        "Ваш код — отправьте друзьям"
+                    } else {
+                        "Ваш код — отправьте хосту, если не соединяется"
+                    })
+                    .size(12.5)
+                    .weak(),
+                );
+                ui.add_space(5.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut code.clone())
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(2)
+                        .font(egui::TextStyle::Monospace),
+                );
+                ui.add_space(8.0);
+                let just_copied = self
+                    .copied_at
+                    .map(|t| t.elapsed() < Duration::from_secs(2))
+                    .unwrap_or(false);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 32.0],
+                        egui::Button::new(if just_copied {
+                            "Скопировано"
+                        } else {
+                            "Скопировать код"
+                        }),
+                    )
+                    .clicked()
+                {
+                    ui.ctx().copy_text(code);
+                    self.copied_at = Some(std::time::Instant::now());
+                }
+                if let Some(note) = upnp {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(note).size(11.0).weak());
+                }
             });
-            ui.add(
-                egui::TextEdit::multiline(&mut code.clone())
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(2)
-                    .font(egui::TextStyle::Monospace),
+            ui.add_space(10.0);
+        }
+
+        if !is_host && !status.is_empty() {
+            ui.label(egui::RichText::new(&status).size(12.5).weak());
+            ui.add_space(8.0);
+        }
+
+        // --- участники ---
+        let speaking = self
+            .engine
+            .as_ref()
+            .map(|e| audio::level_value(&e.controls.voice) > 0.6)
+            .unwrap_or(false);
+
+        card(ui, SURFACE, |ui| {
+            ui.label(
+                egui::RichText::new(format!("В комнате · {}", peers.len()))
+                    .size(12.5)
+                    .weak(),
             );
             ui.add_space(6.0);
-            if ui.button("Скопировать код").clicked() {
-                ui.ctx().copy_text(code);
+            if peers.is_empty() {
+                ui.label(egui::RichText::new("пока никого").weak());
             }
-            if let Some(note) = upnp {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(note).small().weak());
-            }
-            ui.add_space(12.0);
-        }
-
-        if !is_host {
-            ui.label(egui::RichText::new(&status).strong());
-            ui.add_space(10.0);
-        }
-
-        ui.separator();
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Не соединяется? Вставьте код собеседника — начнём стучаться навстречу")
-                .small()
-                .weak(),
-        );
-        let mut do_punch = false;
-        ui.horizontal(|ui| {
-            let width = (ui.available_width() - 96.0).max(80.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.punch_input)
-                    .desired_width(width)
-                    .hint_text("код собеседника"),
-            );
-            do_punch = ui.button("Пробить").clicked();
-        });
-        if do_punch {
-            let code = self.punch_input.trim().to_string();
-            if let Some(engine) = &self.engine {
-                match engine.add_punch_targets(&code) {
-                    Ok(_) => {
-                        self.punch_input.clear();
-                        self.error = None;
+            for (i, (id, name)) in peers.iter().enumerate() {
+                // Свой номер знает только хост; для гостя первый в списке — хост.
+                let me = is_host && i == 0;
+                ui.horizontal(|ui| {
+                    dot(ui, if me && speaking { ACCENT } else { egui::Color32::from_gray(80) });
+                    ui.add_space(2.0);
+                    ui.label(name);
+                    if me {
+                        ui.label(egui::RichText::new("вы").size(10.5).color(ACCENT_DIM));
                     }
-                    Err(e) => self.error = Some(e.to_string()),
-                }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(format!("#{id}")).size(10.5).weak());
+                    });
+                });
             }
-        }
+        });
+        ui.add_space(10.0);
+
+        // --- микрофон ---
+        self.mic_section(ui);
+        ui.add_space(10.0);
+
+        // --- настройки звука ---
+        self.audio_settings(ui);
+        ui.add_space(6.0);
+
+        // --- пробивание ---
+        self.punch_section(ui);
+        ui.add_space(6.0);
+
+        self.log_section(ui);
         ui.add_space(12.0);
 
-        ui.separator();
-        ui.add_space(10.0);
-
-        ui.label(egui::RichText::new("В комнате").small().weak());
-        if peers.is_empty() {
-            ui.label("пока никого");
+        if ui
+            .add_sized(
+                [ui.available_width(), 30.0],
+                egui::Button::new(egui::RichText::new("Выйти из комнаты").color(DANGER)),
+            )
+            .clicked()
+        {
+            self.leave();
         }
-        for (id, name) in &peers {
+    }
+
+    fn mic_section(&mut self, ui: &mut egui::Ui) {
+        let Some(engine) = &self.engine else { return };
+        let level = audio::level_value(&engine.controls.level);
+        let muted = engine.controls.muted.load(Ordering::Relaxed);
+        let input_name = self.shared.lock().unwrap().input_name.clone();
+
+        card(ui, SURFACE, |ui| {
             ui.horizontal(|ui| {
-                ui.label("•");
-                ui.label(name);
-                ui.label(egui::RichText::new(format!("#{id}")).small().weak());
+                ui.label(egui::RichText::new("Микрофон").size(12.5).weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(input_name).size(10.5).weak());
+                });
             });
-        }
-
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(10.0);
-
-        if let Some(engine) = &self.engine {
-            let level = audio::level_value(&engine.controls.level);
-            let voice = audio::level_value(&engine.controls.voice);
-            let muted = engine.controls.muted.load(Ordering::Relaxed);
-            let mut denoise = engine.controls.denoise.load(Ordering::Relaxed);
-            let mut aec = engine.controls.aec.load(Ordering::Relaxed);
-            let mut gate = engine.controls.gate.load(Ordering::Relaxed);
-            let mut sens = audio::level_value(&engine.controls.gate_sensitivity);
-            let mut floor = audio::level_value(&engine.controls.gate_floor);
-
-            ui.label(egui::RichText::new(&input_name).small().weak());
+            ui.add_space(6.0);
             ui.add(
                 egui::ProgressBar::new(if muted { 0.0 } else { level.min(1.0) })
-                    .desired_height(10.0)
-                    .fill(if muted {
-                        egui::Color32::from_gray(70)
-                    } else {
-                        egui::Color32::from_rgb(70, 170, 150)
-                    }),
+                    .desired_height(8.0)
+                    .corner_radius(4)
+                    .fill(if muted { egui::Color32::from_gray(70) } else { ACCENT }),
             );
             ui.add_space(10.0);
-
             let label = if muted {
                 "Включить микрофон"
             } else {
@@ -333,104 +406,186 @@ impl App {
             {
                 engine.controls.muted.store(!muted, Ordering::Relaxed);
             }
-
-            ui.add_space(8.0);
-            if ui
-                .checkbox(&mut aec, "Эхоподавление — можно без наушников")
-                .changed()
-            {
-                engine.controls.aec.store(aec, Ordering::Relaxed);
-            }
-            let dfn_ready = engine.controls.dfn_ready.load(Ordering::Relaxed);
-            if ui
-                .checkbox(&mut denoise, "Шумоподавление (DeepFilterNet 3)")
-                .changed()
-            {
-                engine.controls.denoise.store(denoise, Ordering::Relaxed);
-            }
-            if !dfn_ready {
-                ui.label(
-                    egui::RichText::new("модель загружается, пока работает запасной RNNoise")
-                        .small()
-                        .weak(),
-                );
-            }
-            if ui
-                .checkbox(&mut gate, "Только голос — глушить хлопки и стук")
-                .changed()
-            {
-                engine.controls.gate.store(gate, Ordering::Relaxed);
-            }
-
-            if gate {
-                ui.add_space(2.0);
-                ui.add(
-                    egui::Slider::new(&mut sens, 0.0..=1.0)
-                        .text("чувствительность")
-                        .show_value(false),
-                );
-                ui.add(
-                    egui::Slider::new(&mut floor, 0.0..=0.15)
-                        .text("порог тишины")
-                        .show_value(false),
-                );
-                engine
-                    .controls
-                    .gate_sensitivity
-                    .store(sens.to_bits(), Ordering::Relaxed);
-                engine
-                    .controls
-                    .gate_floor
-                    .store(floor.to_bits(), Ordering::Relaxed);
-                ui.label(
-                    egui::RichText::new(
-                        "меньше чувствительность — строже отбор, но можно потерять тихую речь",
-                    )
-                    .small()
-                    .weak(),
-                );
-            }
-            ui.label(
-                egui::RichText::new(if voice > 0.7 {
-                    "слышу голос"
-                } else if voice > 0.3 {
-                    "что-то есть"
-                } else {
-                    "тихо"
-                })
-                .small()
-                .weak(),
-            );
-        }
-
-        ui.add_space(8.0);
-        if ui
-            .add_sized([ui.available_width(), 30.0], egui::Button::new("Выйти"))
-            .clicked()
-        {
-            self.leave();
-            return;
-        }
-
-        ui.add_space(10.0);
-        self.ui_log(ui);
+        });
     }
 
-    fn ui_log(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.show_log, "Показать журнал");
-        if !self.show_log {
-            return;
-        }
-        let lines = self.shared.lock().unwrap().log.clone();
-        egui::ScrollArea::vertical()
-            .max_height(150.0)
-            .stick_to_bottom(true)
+    fn audio_settings(&mut self, ui: &mut egui::Ui) {
+        let Some(engine) = &self.engine else { return };
+        let c = &engine.controls;
+
+        egui::CollapsingHeader::new("Обработка звука")
+            .default_open(false)
             .show(ui, |ui| {
-                for line in lines {
-                    ui.label(egui::RichText::new(line).small().monospace());
+                let mut aec = c.aec.load(Ordering::Relaxed);
+                let mut denoise = c.denoise.load(Ordering::Relaxed);
+                let mut gate = c.gate.load(Ordering::Relaxed);
+
+                if ui
+                    .checkbox(&mut aec, "Эхоподавление — можно без наушников")
+                    .changed()
+                {
+                    c.aec.store(aec, Ordering::Relaxed);
+                }
+                if ui
+                    .checkbox(&mut denoise, "Шумоподавление (DeepFilterNet 3)")
+                    .changed()
+                {
+                    c.denoise.store(denoise, Ordering::Relaxed);
+                }
+                if !c.dfn_ready.load(Ordering::Relaxed) {
+                    ui.label(
+                        egui::RichText::new("модель загружается, пока работает RNNoise")
+                            .size(11.0)
+                            .weak(),
+                    );
+                }
+                if ui
+                    .checkbox(&mut gate, "Только голос — глушить хлопки и стук")
+                    .changed()
+                {
+                    c.gate.store(gate, Ordering::Relaxed);
+                }
+
+                if gate {
+                    ui.add_space(4.0);
+                    let mut sens = audio::level_value(&c.gate_sensitivity);
+                    let mut floor = audio::level_value(&c.gate_floor);
+                    ui.add(
+                        egui::Slider::new(&mut sens, 0.0..=1.0)
+                            .text("чувствительность")
+                            .show_value(false),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut floor, 0.0..=0.15)
+                            .text("порог тишины")
+                            .show_value(false),
+                    );
+                    c.gate_sensitivity.store(sens.to_bits(), Ordering::Relaxed);
+                    c.gate_floor.store(floor.to_bits(), Ordering::Relaxed);
+                    ui.label(
+                        egui::RichText::new(
+                            "пропадает начало фраз — поднимите чувствительность; \
+                             проходят хлопки — опустите",
+                        )
+                        .size(11.0)
+                        .weak(),
+                    );
                 }
             });
     }
+
+    fn punch_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Не соединяется?")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Попросите код у собеседника и вставьте сюда — начнём \
+                         стучаться навстречу, и роутеры откроют путь.",
+                    )
+                    .size(11.5)
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.punch_input)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("код собеседника"),
+                );
+                ui.add_space(6.0);
+                let go = ui
+                    .add_sized([ui.available_width(), 30.0], egui::Button::new("Пробить"))
+                    .clicked();
+                if go {
+                    let code = self.punch_input.trim().to_string();
+                    if let Some(engine) = &self.engine {
+                        match engine.add_punch_targets(&code) {
+                            Ok(_) => {
+                                self.punch_input.clear();
+                                self.error = None;
+                            }
+                            Err(e) => self.error = Some(e.to_string()),
+                        }
+                    }
+                }
+            });
+    }
+
+    fn log_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Журнал")
+            .default_open(false)
+            .show(ui, |ui| {
+                let lines = self.shared.lock().unwrap().log.clone();
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .stick_to_bottom(true)
+                    .id_salt("log")
+                    .show(ui, |ui| {
+                        for line in lines {
+                            ui.label(egui::RichText::new(line).size(11.0).monospace());
+                        }
+                    });
+            });
+    }
+}
+
+// --- мелкие строительные блоки ---
+
+fn card(ui: &mut egui::Ui, fill: egui::Color32, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(12, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        });
+}
+
+fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add_sized(
+        [ui.available_width(), 38.0],
+        egui::Button::new(egui::RichText::new(text).strong().color(egui::Color32::WHITE))
+            .fill(ACCENT_DIM)
+            .corner_radius(7),
+    )
+}
+
+fn pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.22))
+        .corner_radius(9)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).size(11.0).color(color));
+        });
+}
+
+fn dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+fn setup_theme(ctx: &egui::Context) {
+    ctx.set_visuals(egui::Visuals::dark());
+    ctx.all_styles_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 7.0);
+        s.spacing.button_padding = egui::vec2(12.0, 6.0);
+        s.spacing.slider_width = 180.0;
+        s.visuals.panel_fill = egui::Color32::from_rgb(24, 27, 29);
+        s.visuals.window_fill = egui::Color32::from_rgb(24, 27, 29);
+        s.visuals.selection.bg_fill = ACCENT_DIM;
+        s.visuals.hyperlink_color = ACCENT;
+        for w in [
+            &mut s.visuals.widgets.inactive,
+            &mut s.visuals.widgets.hovered,
+            &mut s.visuals.widgets.active,
+            &mut s.visuals.widgets.noninteractive,
+            &mut s.visuals.widgets.open,
+        ] {
+            w.corner_radius = egui::CornerRadius::same(6);
+        }
+    });
 }
 
 fn default_nickname() -> String {
