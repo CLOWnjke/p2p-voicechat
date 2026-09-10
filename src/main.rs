@@ -37,6 +37,7 @@ struct App {
     phase: Phase,
     nickname: String,
     code_input: String,
+    punch_input: String,
     error: Option<String>,
     engine: Option<net::Engine>,
     pending: Option<Receiver<Result<net::Prepared, String>>>,
@@ -56,6 +57,7 @@ impl App {
             phase: Phase::Menu,
             nickname: default_nickname(),
             code_input: String::new(),
+            punch_input: String::new(),
             error: None,
             engine: None,
             pending: None,
@@ -220,29 +222,64 @@ impl App {
             )
         };
 
-        if is_host {
-            if let Some(code) = invite {
-                ui.label("Код приглашения — отправьте его друзьям");
-                ui.add(
-                    egui::TextEdit::multiline(&mut code.clone())
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(2)
-                        .font(egui::TextStyle::Monospace),
-                );
-                ui.add_space(6.0);
-                if ui.button("Скопировать код").clicked() {
-                    ui.ctx().copy_text(code);
-                }
-                if let Some(note) = upnp {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(note).small().weak());
-                }
-                ui.add_space(14.0);
+        if let Some(code) = invite {
+            ui.label(if is_host {
+                "Ваш код — отправьте его друзьям"
+            } else {
+                "Ваш код — отправьте его хосту"
+            });
+            ui.add(
+                egui::TextEdit::multiline(&mut code.clone())
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(2)
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.add_space(6.0);
+            if ui.button("Скопировать код").clicked() {
+                ui.ctx().copy_text(code);
             }
-        } else {
-            ui.label(egui::RichText::new(&status).strong());
+            if let Some(note) = upnp {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(note).small().weak());
+            }
             ui.add_space(12.0);
         }
+
+        if !is_host {
+            ui.label(egui::RichText::new(&status).strong());
+            ui.add_space(10.0);
+        }
+
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Не соединяется? Вставьте код собеседника — начнём стучаться навстречу")
+                .small()
+                .weak(),
+        );
+        let mut do_punch = false;
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 96.0).max(80.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.punch_input)
+                    .desired_width(width)
+                    .hint_text("код собеседника"),
+            );
+            do_punch = ui.button("Пробить").clicked();
+        });
+        if do_punch {
+            let code = self.punch_input.trim().to_string();
+            if let Some(engine) = &self.engine {
+                match engine.add_punch_targets(&code) {
+                    Ok(_) => {
+                        self.punch_input.clear();
+                        self.error = None;
+                    }
+                    Err(e) => self.error = Some(e.to_string()),
+                }
+            }
+        }
+        ui.add_space(12.0);
 
         ui.separator();
         ui.add_space(10.0);

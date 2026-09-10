@@ -33,6 +33,8 @@ const T_WELCOME: u8 = 0x02;
 const T_AUDIO: u8 = 0x03;
 const T_PING: u8 = 0x04;
 const T_BYE: u8 = 0x05;
+/// Пустой пакет, который шлют «навстречу», чтобы NAT открыл путь для ответных.
+const T_PUNCH: u8 = 0x06;
 
 const HOST_ID: u16 = 1;
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,6 +42,18 @@ const PORT_RANGE: std::ops::Range<u16> = 47100..47120;
 
 /// Куда клиент реально дозвонился. Пока None — ещё стучимся.
 type Locked = Arc<Mutex<Option<SocketAddr>>>;
+
+/// Адреса, в которые мы шлём пустые пакеты навстречу собеседнику.
+///
+/// Домашние роутеры обычно пропускают входящий пакет только с того адреса,
+/// куда мы сами уже что-то отправляли. Поэтому если обе стороны начнут слать
+/// друг другу одновременно, путь открывается в обе стороны — и дальше обычные
+/// HELLO долетают. Это и есть пробивание NAT, ради которого стороны меняются
+/// кодами в обе стороны, а не только гость получает код хоста.
+type PunchList = Arc<Mutex<Vec<(SocketAddr, Instant)>>>;
+
+/// Сколько времени продолжаем стучаться в добавленный адрес.
+const PUNCH_FOR: Duration = Duration::from_secs(180);
 
 /// Всё, что видит интерфейс. Ничего тяжёлого сюда не кладём: блокировка берётся
 /// и из потока отрисовки, и из сетевых потоков.
@@ -109,8 +123,35 @@ pub struct Engine {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     _audio: AudioEngine,
+    punch: PunchList,
+    shared: Arc<Mutex<Shared>>,
     pub muted: Arc<AtomicBool>,
     pub level: Level,
+}
+
+impl Engine {
+    /// Добавляет адреса собеседника, в которые надо стучаться навстречу.
+    /// Нужно, когда NAT не пропускает входящие «просто так».
+    pub fn add_punch_targets(&self, code: &str) -> Result<usize> {
+        let addrs = decode_invite(code)?;
+        let now = Instant::now();
+        let mut list = self.punch.lock().unwrap();
+        for addr in &addrs {
+            list.retain(|(a, _)| a != addr);
+            list.push((*addr, now));
+        }
+        drop(list);
+
+        self.shared.lock().unwrap().log(format!(
+            "стучимся навстречу: {}",
+            addrs
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        Ok(addrs.len())
+    }
 }
 
 impl Engine {
@@ -136,42 +177,10 @@ impl Engine {
             }
         }
 
-        let mut candidates: Vec<SocketAddr> = Vec::new();
-
-        match nat::discover_public_addr(&socket) {
-            Ok(addr) => {
-                shared
-                    .lock()
-                    .unwrap()
-                    .log(format!("внешний адрес по STUN: {addr}"));
-                candidates.push(addr);
-            }
-            Err(e) => {
-                shared.lock().unwrap().log(format!("STUN не ответил: {e}"));
-            }
-        }
-
-        if let Some(ip) = nat::local_ipv4() {
-            candidates.push(SocketAddr::new(IpAddr::V4(ip), port));
-        }
-        candidates.push(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port));
-
-        candidates.dedup();
-        if candidates.is_empty() {
-            return Err(anyhow!("не удалось определить ни одного адреса"));
-        }
-
+        let candidates = my_candidates(&socket, port, &shared)?;
         let invite = encode_invite(&candidates);
         {
             let mut s = shared.lock().unwrap();
-            s.log(format!(
-                "адреса в приглашении: {}",
-                candidates
-                    .iter()
-                    .map(|a| a.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
             s.is_host = true;
             s.connected = true;
             s.invite = Some(invite);
@@ -210,14 +219,10 @@ impl Engine {
             ));
         }
 
-        // Свой внешний адрес нам не нужен, но запрос к STUN создаёт отображение
-        // в NAT — после него наш сокет готов принимать ответы снаружи.
-        if let Ok(addr) = nat::discover_public_addr(&socket) {
-            shared
-                .lock()
-                .unwrap()
-                .log(format!("наш внешний адрес: {addr}"));
-        }
+        // Свои адреса нужны не только для порядка: если NAT хоста не пропускает
+        // входящие, он попросит наш код и начнёт стучаться навстречу.
+        let mine = my_candidates(&socket, port, &shared)?;
+        shared.lock().unwrap().invite = Some(encode_invite(&mine));
 
         Ok(Prepared {
             socket,
@@ -286,14 +291,17 @@ impl Engine {
             is_host,
         ));
 
+        let punch: PunchList = Arc::new(Mutex::new(Vec::new()));
+
         threads.push(spawn_keepalive(
             socket,
-            shared,
+            shared.clone(),
             table,
             stop.clone(),
             nickname,
             candidates,
             locked,
+            punch.clone(),
             is_host,
         ));
 
@@ -301,6 +309,8 @@ impl Engine {
             stop,
             threads,
             _audio: audio,
+            punch,
+            shared,
             muted,
             level,
         })
@@ -325,6 +335,52 @@ fn bind_in_range() -> Result<(UdpSocket, u16)> {
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     let port = sock.local_addr()?.port();
     Ok((sock, port))
+}
+
+/// Собирает адреса, по которым до нас можно достучаться: внешний по STUN,
+/// адрес в локальной сети и петлевой.
+fn my_candidates(
+    socket: &UdpSocket,
+    port: u16,
+    shared: &Arc<Mutex<Shared>>,
+) -> Result<Vec<SocketAddr>> {
+    let mut candidates: Vec<SocketAddr> = Vec::new();
+
+    match nat::discover_public_addr(socket) {
+        Ok(addr) => {
+            shared
+                .lock()
+                .unwrap()
+                .log(format!("наш внешний адрес по STUN: {addr}"));
+            candidates.push(addr);
+        }
+        Err(e) => {
+            shared.lock().unwrap().log(format!("STUN не ответил: {e}"));
+        }
+    }
+
+    if let Some(ip) = nat::local_ipv4() {
+        candidates.push(SocketAddr::new(IpAddr::V4(ip), port));
+    }
+    candidates.push(SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+    ));
+
+    candidates.dedup();
+    if candidates.is_empty() {
+        return Err(anyhow!("не удалось определить ни одного адреса"));
+    }
+
+    shared.lock().unwrap().log(format!(
+        "наши адреса: {}",
+        candidates
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    Ok(candidates)
 }
 
 fn encode_invite(candidates: &[SocketAddr]) -> String {
@@ -595,6 +651,7 @@ fn spawn_keepalive(
     nickname: String,
     candidates: Vec<SocketAddr>,
     locked: Locked,
+    punch: PunchList,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -604,6 +661,17 @@ fn spawn_keepalive(
         while !stop.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(500));
             tick += 1;
+
+            // Стучимся навстречу по адресам, которые нам дали вручную.
+            // Пакет ничего не значит: он нужен только чтобы наш роутер
+            // запомнил этот адрес как «мы туда уже писали».
+            {
+                let mut list = punch.lock().unwrap();
+                list.retain(|(_, added)| added.elapsed() < PUNCH_FOR);
+                for (addr, _) in list.iter() {
+                    let _ = socket.send_to(&header(T_PUNCH), *addr);
+                }
+            }
 
             if is_host {
                 // Хост выкидывает тех, кто замолчал.
