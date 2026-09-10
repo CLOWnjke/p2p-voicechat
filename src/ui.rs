@@ -367,6 +367,58 @@ pub fn section(
     state
 }
 
+/// Компактный фейдер громкости собеседника — как канальный на пульте.
+/// Диапазон 0..2, единица посередине помечена засечкой.
+pub fn mini_fader(ui: &mut Ui, value: &mut f32, width: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 12.0), Sense::click_and_drag());
+    let mut changed = false;
+
+    if resp.dragged() || resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let t = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            *value = t * 2.0;
+            changed = true;
+        }
+    }
+    // Двойной щелчок возвращает единицу — иначе поймать её мышью невозможно.
+    if resp.double_clicked() {
+        *value = 1.0;
+        changed = true;
+    }
+
+    let t = (*value / 2.0).clamp(0.0, 1.0);
+    let y = rect.center().y;
+    let p = ui.painter();
+    p.line_segment(
+        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+        Stroke::new(1.0, LINE),
+    );
+    // Засечка единицы.
+    let mid = rect.left() + rect.width() * 0.5;
+    p.line_segment(
+        [egui::pos2(mid, y - 3.0), egui::pos2(mid, y + 3.0)],
+        Stroke::new(1.0, LINE),
+    );
+    p.line_segment(
+        [
+            egui::pos2(rect.left(), y),
+            egui::pos2(rect.left() + rect.width() * t, y),
+        ],
+        Stroke::new(1.0, if resp.hovered() { ACCENT } else { DIMMER }),
+    );
+    let hx = rect.left() + rect.width() * t;
+    p.rect_filled(
+        Rect::from_min_size(egui::pos2(hx - 1.0, rect.top() + 1.0), egui::vec2(2.0, 10.0)),
+        CornerRadius::ZERO,
+        if resp.hovered() { ACCENT } else { DIM },
+    );
+
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    changed
+}
+
 /// Схема тракта: что включено и во что это обходится по задержке.
 pub fn chain(ui: &mut Ui, aec: bool, dfn: bool, gate: bool) {
     let stages: [(&str, &str, bool); 5] = [

@@ -52,6 +52,11 @@ struct App {
     disp: f32,
     peak: f32,
     last_frame: Instant,
+    devices: audio::DevicePrefs,
+    /// Списки устройств читаются один раз: опрос звуковой подсистемы не
+    /// бесплатный, а делать его каждый кадр отрисовки — верный способ
+    /// подвесить окно.
+    dev_lists: Option<(Vec<String>, Vec<String>)>,
 }
 
 impl App {
@@ -70,6 +75,8 @@ impl App {
             disp: 0.0,
             peak: 0.0,
             last_frame: Instant::now(),
+            devices: audio::DevicePrefs::default(),
+            dev_lists: None,
         }
     }
 
@@ -117,7 +124,11 @@ impl App {
         self.pending = None;
 
         match result {
-            Ok(prepared) => match net::Engine::start(prepared, self.shared.clone()) {
+            Ok(prepared) => match net::Engine::start(
+                prepared,
+                self.shared.clone(),
+                self.devices.clone(),
+            ) {
                 Ok(engine) => {
                     self.engine = Some(engine);
                     self.phase = Phase::Active;
@@ -336,7 +347,9 @@ impl App {
             self.begin(false);
         }
 
-        ui.add_space(28.0);
+        ui.add_space(26.0);
+        self.devices_section(ui);
+        ui.add_space(16.0);
         hairline(ui, LINE_DIM);
         ui.add_space(10.0);
         footer(
@@ -350,7 +363,7 @@ impl App {
     }
 
     fn ui_active(&mut self, ui: &mut egui::Ui) {
-        let (invite, upnp, peers, status, is_host, my_id, voice_seen) = {
+        let (invite, upnp, peers, status, is_host, my_id, voice_seen, muted_peers) = {
             let s = self.shared.lock().unwrap();
             (
                 s.invite.clone(),
@@ -360,6 +373,7 @@ impl App {
                 s.is_host,
                 s.my_id,
                 s.voice_seen.clone(),
+                s.muted_peers.keys().copied().collect::<Vec<_>>(),
             )
         };
 
@@ -490,8 +504,19 @@ impl App {
             ui.add_space(9.0);
             mono(ui, "пока никого", 11.5, DIM);
         }
+        let i_mute = self
+            .engine
+            .as_ref()
+            .map(|e| e.controls.muted.load(Ordering::Relaxed))
+            .unwrap_or(false);
+
         for (id, name) in peers.iter() {
             let me = *id == my_id;
+            let muted = if me {
+                i_mute
+            } else {
+                muted_peers.contains(id)
+            };
             // Про остальных — по флагу речи, который приходит в звуковом пакете.
             let active = if me {
                 i_speak
@@ -501,16 +526,38 @@ impl App {
                     .map(|t| t.elapsed() < Duration::from_millis(350))
                     .unwrap_or(false)
             };
+
             ui.add_space(7.0);
             ui.horizontal(|ui| {
-                bars(ui, active);
+                bars(ui, active, muted);
                 ui.add_space(6.0);
-                mono(ui, name.clone(), 12.5, if me { TEXT } else { TEXT_2 });
+                let name_color = if muted {
+                    DIM
+                } else if me {
+                    TEXT
+                } else {
+                    TEXT_2
+                };
+                mono(ui, name.clone(), 12.5, name_color);
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     mono(ui, format!("#{id}"), 10.0, FAINT);
+                    ui.add_space(8.0);
                     if me {
-                        ui.add_space(8.0);
                         mono(ui, spaced("ВЫ"), 9.5, ACCENT);
+                    } else if let Some(engine) = &self.engine {
+                        // Громкость собеседника прямо в строке, как канальный
+                        // фейдер на пульте: двойной щелчок возвращает единицу.
+                        let mut v = engine
+                            .volumes
+                            .lock()
+                            .unwrap()
+                            .get(id)
+                            .copied()
+                            .unwrap_or(1.0);
+                        if mini_fader(ui, &mut v, 62.0) {
+                            engine.volumes.lock().unwrap().insert(*id, v);
+                        }
                     }
                 });
             });
@@ -596,6 +643,52 @@ impl App {
         {
             controls.muted.store(true, Ordering::Relaxed);
         }
+    }
+
+    fn devices_section(&mut self, ui: &mut egui::Ui) {
+        let picked = self
+            .devices
+            .input
+            .clone()
+            .unwrap_or_else(|| "СИСТЕМНОЕ".into());
+        let short: String = picked.chars().take(18).collect();
+        let mut state = section(
+            ui,
+            "devices",
+            "УСТРОЙСТВА",
+            Some((&short.to_uppercase(), FAINT)),
+        );
+
+        state.show_body_unindented(ui, |ui| {
+            if self.dev_lists.is_none() {
+                self.dev_lists = Some(audio::list_devices());
+            }
+            let (ins, outs) = self.dev_lists.clone().unwrap_or_default();
+
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new("Меняется только до входа в комнату.")
+                    .size(10.0)
+                    .color(DIM)
+                    .monospace(),
+            );
+            ui.add_space(12.0);
+
+            micro(ui, "МИКРОФОН", DIM);
+            ui.add_space(5.0);
+            device_list(ui, &ins, &mut self.devices.input, "in");
+            ui.add_space(14.0);
+
+            micro(ui, "ВЫВОД", DIM);
+            ui.add_space(5.0);
+            device_list(ui, &outs, &mut self.devices.output, "out");
+
+            ui.add_space(10.0);
+            if button(ui, "ОБНОВИТЬ СПИСОК", 26.0, None, None, Some(LINE), DIM, 9.5).clicked() {
+                self.dev_lists = Some(audio::list_devices());
+            }
+            ui.add_space(12.0);
+        });
     }
 
     fn chain_section(&mut self, ui: &mut egui::Ui) {
@@ -798,11 +891,70 @@ fn footer(ui: &mut egui::Ui, items: [(&str, &str); 3]) {
     });
 }
 
-/// Три полоски-эквалайзера у имени: горят, когда человек говорит.
-fn bars(ui: &mut egui::Ui, active: bool) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 12.0), egui::Sense::hover());
-    let heights = if active { [5.0, 11.0, 7.0] } else { [3.0, 3.0, 3.0] };
-    let color = if active { ACCENT } else { LINE };
+/// Список устройств: первая строка — системное по умолчанию.
+fn device_list(ui: &mut egui::Ui, items: &[String], picked: &mut Option<String>, salt: &str) {
+    let mut row = |ui: &mut egui::Ui, label: &str, selected: bool| -> bool {
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 22.0),
+            egui::Sense::click(),
+        );
+        let hovered = resp.hovered();
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let mark = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.center().y - 4.0),
+            egui::vec2(8.0, 8.0),
+        );
+        if selected {
+            ui.painter().rect_filled(mark, egui::CornerRadius::ZERO, ACCENT);
+        } else {
+            ui.painter().rect_stroke(
+                mark,
+                egui::CornerRadius::ZERO,
+                egui::Stroke::new(1.0, if hovered { DIMMER } else { LINE }),
+                egui::StrokeKind::Inside,
+            );
+        }
+        ui.painter().text(
+            egui::pos2(rect.left() + 16.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::monospace(11.0),
+            if selected { TEXT } else { TEXT_2 },
+        );
+        resp.clicked()
+    };
+
+    ui.push_id(salt, |ui| {
+        if row(ui, "системное по умолчанию", picked.is_none()) {
+            *picked = None;
+        }
+        for name in items {
+            let short: String = name.chars().take(38).collect();
+            if row(ui, &short, picked.as_deref() == Some(name.as_str())) {
+                *picked = Some(name.clone());
+            }
+        }
+    });
+}
+
+/// Три полоски-эквалайзера у имени. Горят, когда человек говорит;
+/// перечёркнуты, когда он выключил микрофон.
+fn bars(ui: &mut egui::Ui, active: bool, muted: bool) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 12.0), egui::Sense::hover());
+    let heights = if active && !muted {
+        [5.0, 11.0, 7.0]
+    } else {
+        [3.0, 3.0, 3.0]
+    };
+    let color = if muted {
+        LINE_DIM
+    } else if active {
+        ACCENT
+    } else {
+        LINE
+    };
     for (i, h) in heights.iter().enumerate() {
         let x = rect.left() + i as f32 * 5.0;
         let r = egui::Rect::from_min_size(
@@ -810,6 +962,16 @@ fn bars(ui: &mut egui::Ui, active: bool) {
             egui::vec2(3.0, *h),
         );
         ui.painter().rect_filled(r, egui::CornerRadius::ZERO, color);
+    }
+    if muted {
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left() - 1.0, rect.bottom() + 1.0),
+                egui::pos2(rect.right() + 1.0, rect.top() - 1.0),
+            ],
+            egui::Stroke::new(1.0, DIM),
+        );
+        resp.on_hover_text("Микрофон выключен");
     }
 }
 

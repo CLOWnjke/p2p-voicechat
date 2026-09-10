@@ -40,10 +40,87 @@ const T_BYE: u8 = 0x05;
 const T_PUNCH: u8 = 0x06;
 /// Состав комнаты: хост рассылает его гостям при каждом изменении.
 const T_PEERS: u8 = 0x07;
+/// Состояние участника: пока это только выключенный микрофон. Едет
+/// отдельным пакетом, потому что молчащий человек не шлёт звук вообще,
+/// и по звуковым пакетам о нём ничего не узнать.
+const T_STATE: u8 = 0x08;
 
 const HOST_ID: u16 = 1;
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 const PORT_RANGE: std::ops::Range<u16> = 47100..47120;
+
+/// Сколько кадров держим, прежде чем начать проигрывать. Три кадра — это
+/// 60 мс: хватает, чтобы переставить местами пришедшие не по порядку пакеты,
+/// и ещё не слышно как задержка.
+const JITTER_FRAMES: usize = 3;
+
+/// Приёмная сторона одного собеседника: буфер, декодер и порядковый счёт.
+///
+/// UDP не обещает ни порядка, ни доставки. Без этого буфера переставленные
+/// пакеты слышны как щелчки, а потерянные — как дырки. Здесь первые
+/// раскладываются по местам, а на вторые Opus достраивает правдоподобный
+/// кусок сам.
+struct Incoming {
+    dec: opus::Decoder,
+    pending: std::collections::BTreeMap<u16, Vec<u8>>,
+    next: Option<u16>,
+}
+
+impl Incoming {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            dec: opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)?,
+            pending: std::collections::BTreeMap::new(),
+            next: None,
+        })
+    }
+
+    /// Кладёт пакет и отдаёт всё, что уже можно проиграть.
+    fn push(&mut self, seq: u16, payload: &[u8], pcm: &mut [i16], out: &mut Vec<f32>) {
+        if let Some(next) = self.next {
+            // Опоздавший пакет: место, куда он должен был встать, уже проиграно.
+            if seq.wrapping_sub(next) as i16 > 0x3000 {
+                return;
+            }
+        }
+        self.pending.insert(seq, payload.to_vec());
+
+        // Слишком большой разрыв — проще начать заново, чем достраивать.
+        if self.pending.len() > JITTER_FRAMES * 6 {
+            self.pending.clear();
+            self.next = None;
+            return;
+        }
+        if self.pending.len() <= JITTER_FRAMES {
+            return;
+        }
+
+        while self.pending.len() > JITTER_FRAMES {
+            let Some((&seq, _)) = self.pending.iter().next() else {
+                break;
+            };
+            let want = self.next.unwrap_or(seq);
+
+            // Пропущенные кадры достраиваем: Opus умеет восстанавливать
+            // потерю по предыдущему кадру, и это гораздо лучше тишины.
+            let gap = seq.wrapping_sub(want);
+            for _ in 0..gap.min(3) {
+                if let Ok(n) = self.dec.decode(&[], pcm, false) {
+                    out.extend(pcm[..n].iter().map(|s| *s as f32 / i16::MAX as f32));
+                }
+            }
+
+            let data = self.pending.remove(&seq).unwrap();
+            if let Ok(n) = self.dec.decode(&data, pcm, false) {
+                out.extend(pcm[..n].iter().map(|s| *s as f32 / i16::MAX as f32));
+            }
+            self.next = Some(seq.wrapping_add(1));
+        }
+    }
+}
+
+/// Громкость каждого собеседника, 0..2. Крутится из интерфейса.
+pub type Volumes = Arc<Mutex<HashMap<u16, f32>>>;
 
 /// Куда клиент реально дозвонился. Пока None — ещё стучимся.
 type Locked = Arc<Mutex<Option<SocketAddr>>>;
@@ -77,6 +154,8 @@ pub struct Shared {
     pub my_id: u16,
     /// Когда от кого в последний раз приходил признак речи.
     pub voice_seen: HashMap<u16, Instant>,
+    /// У кого выключен микрофон.
+    pub muted_peers: HashMap<u16, Instant>,
 }
 
 impl Shared {
@@ -135,6 +214,7 @@ pub struct Engine {
     punch: PunchList,
     shared: Arc<Mutex<Shared>>,
     pub controls: audio::Controls,
+    pub volumes: Volumes,
 }
 
 impl Engine {
@@ -242,7 +322,11 @@ impl Engine {
     }
 
     /// Поднимает звук и сетевые потоки. Вызывается из потока интерфейса.
-    pub fn start(prepared: Prepared, shared: Arc<Mutex<Shared>>) -> Result<Self> {
+    pub fn start(
+        prepared: Prepared,
+        shared: Arc<Mutex<Shared>>,
+        devices: audio::DevicePrefs,
+    ) -> Result<Self> {
         let Prepared {
             socket,
             candidates,
@@ -258,6 +342,7 @@ impl Engine {
             next_id: HOST_ID + 1,
         }));
         let locked: Locked = Arc::new(Mutex::new(None));
+        let volumes: Volumes = Arc::new(Mutex::new(HashMap::new()));
 
         let stop = Arc::new(AtomicBool::new(false));
         let controls = audio::Controls::new();
@@ -265,7 +350,7 @@ impl Engine {
 
         let (frames_tx, frames_rx) = sync_channel::<Vec<i16>>(8);
 
-        let audio = audio::start(frames_tx, mixer.clone(), controls.clone())?;
+        let audio = audio::start(frames_tx, mixer.clone(), controls.clone(), devices)?;
         {
             let mut s = shared.lock().unwrap();
             s.input_name = audio.input_name.clone();
@@ -286,6 +371,7 @@ impl Engine {
             my_id.clone(),
             nickname.clone(),
             locked.clone(),
+            volumes.clone(),
             is_host,
         ));
 
@@ -312,6 +398,8 @@ impl Engine {
             locked,
             punch.clone(),
             mixer,
+            controls.clone(),
+            my_id,
             is_host,
         ));
 
@@ -322,6 +410,7 @@ impl Engine {
             punch,
             shared,
             controls,
+            volumes,
         })
     }
 }
@@ -496,11 +585,13 @@ fn spawn_rx(
     my_id: Arc<Mutex<u16>>,
     nickname: String,
     locked: Locked,
+    volumes: Volumes,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut decoders: HashMap<u16, opus::Decoder> = HashMap::new();
-        let mut pcm = vec![0i16; FRAME];
+        let mut streams: HashMap<u16, Incoming> = HashMap::new();
+        let mut pcm = vec![0i16; FRAME * 2];
+        let mut decoded: Vec<f32> = Vec::with_capacity(FRAME * 4);
         let mut buf = [0u8; 2048];
 
         while !stop.load(Ordering::Relaxed) {
@@ -590,6 +681,7 @@ fn spawn_rx(
                         continue;
                     }
                     let src = u16::from_be_bytes([body[0], body[1]]);
+                    let seq = u16::from_be_bytes([body[2], body[3]]);
                     let voiced = body[4] & 1 != 0;
 
                     // Хост пересылает пакет всем остальным как есть.
@@ -613,16 +705,52 @@ fn spawn_rx(
                         shared.lock().unwrap().voice_seen.insert(src, Instant::now());
                     }
 
-                    let dec = decoders.entry(src).or_insert_with(|| {
-                        opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)
-                            .expect("не удалось создать декодер Opus")
-                    });
-                    if let Ok(len) = dec.decode(&body[5..], &mut pcm, false) {
-                        let samples: Vec<f32> = pcm[..len]
-                            .iter()
-                            .map(|s| *s as f32 / i16::MAX as f32)
-                            .collect();
-                        mixer.push(src, &samples);
+                    let stream = match streams.entry(src) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(e) => match Incoming::new() {
+                            Ok(v) => e.insert(v),
+                            Err(_) => continue,
+                        },
+                    };
+
+                    decoded.clear();
+                    stream.push(seq, &body[5..], &mut pcm, &mut decoded);
+                    if !decoded.is_empty() {
+                        let gain = volumes
+                            .lock()
+                            .unwrap()
+                            .get(&src)
+                            .copied()
+                            .unwrap_or(1.0);
+                        if (gain - 1.0).abs() > 0.01 {
+                            for s in decoded.iter_mut() {
+                                *s *= gain;
+                            }
+                        }
+                        mixer.push(src, &decoded);
+                    }
+                }
+
+                T_STATE => {
+                    if body.len() < 3 {
+                        continue;
+                    }
+                    let src = u16::from_be_bytes([body[0], body[1]]);
+                    let muted = body[2] & 1 != 0;
+
+                    // Хост пересылает состояние остальным.
+                    if is_host {
+                        let t = table.lock().unwrap();
+                        for addr in t.addrs_except(Some(from)) {
+                            let _ = socket.send_to(&buf[..n], addr);
+                        }
+                    }
+
+                    let mut sh = shared.lock().unwrap();
+                    if muted {
+                        sh.muted_peers.insert(src, Instant::now());
+                    } else {
+                        sh.muted_peers.remove(&src);
                     }
                 }
 
@@ -737,6 +865,8 @@ fn spawn_keepalive(
     locked: Locked,
     punch: PunchList,
     mixer: Arc<Mixer>,
+    controls: audio::Controls,
+    my_id: Arc<Mutex<u16>>,
     is_host: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -755,6 +885,22 @@ fn spawn_keepalive(
                 list.retain(|(_, added)| added.elapsed() < PUNCH_FOR);
                 for (addr, _) in list.iter() {
                     let _ = socket.send_to(&header(T_PUNCH), *addr);
+                }
+            }
+
+            // Своё состояние рассылаем всем: выключенный микрофон вообще не
+            // шлёт звук, поэтому узнать о нём по звуковым пакетам нельзя.
+            {
+                let mut msg = header(T_STATE);
+                msg.extend_from_slice(&my_id.lock().unwrap().to_be_bytes());
+                msg.push(if controls.muted.load(Ordering::Relaxed) { 1 } else { 0 });
+                if is_host {
+                    let addrs = table.lock().unwrap().addrs_except(None);
+                    for addr in addrs {
+                        let _ = socket.send_to(&msg, addr);
+                    }
+                } else if let Some(host) = *locked.lock().unwrap() {
+                    let _ = socket.send_to(&msg, host);
                 }
             }
 

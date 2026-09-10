@@ -269,6 +269,27 @@ impl Default for Controls {
     }
 }
 
+/// Какие устройства выбрал человек. Пусто — берём системные по умолчанию.
+#[derive(Clone, Default)]
+pub struct DevicePrefs {
+    pub input: Option<String>,
+    pub output: Option<String>,
+}
+
+/// Списки доступных устройств для выпадающего выбора.
+pub fn list_devices() -> (Vec<String>, Vec<String>) {
+    let host = cpal::default_host();
+    let ins = host
+        .input_devices()
+        .map(|it| it.map(|d| device_name(&d, "микрофон")).collect())
+        .unwrap_or_default();
+    let outs = host
+        .output_devices()
+        .map(|it| it.map(|d| device_name(&d, "динамики")).collect())
+        .unwrap_or_default();
+    (ins, outs)
+}
+
 /// Имя устройства: в cpal 0.18 оно лежит внутри описания.
 fn device_name(dev: &cpal::Device, fallback: &str) -> String {
     dev.description()
@@ -302,14 +323,33 @@ pub fn start(
     frames_tx: SyncSender<Vec<i16>>,
     mixer: Arc<Mixer>,
     controls: Controls,
+    prefs: DevicePrefs,
 ) -> Result<AudioEngine> {
     let host = cpal::default_host();
 
-    let in_dev = host
-        .default_input_device()
+    // Выбранное по имени, иначе системное по умолчанию. Если названное
+    // устройство исчезло (выдернули гарнитуру), молча берём умолчание —
+    // это лучше, чем отказаться запускаться.
+    let in_dev = prefs
+        .input
+        .as_ref()
+        .and_then(|want| {
+            host.input_devices().ok().and_then(|mut it| {
+                it.find(|d| device_name(d, "") == *want)
+            })
+        })
+        .or_else(|| host.default_input_device())
         .ok_or_else(|| anyhow!("не найден микрофон"))?;
-    let out_dev = host
-        .default_output_device()
+
+    let out_dev = prefs
+        .output
+        .as_ref()
+        .and_then(|want| {
+            host.output_devices().ok().and_then(|mut it| {
+                it.find(|d| device_name(d, "") == *want)
+            })
+        })
+        .or_else(|| host.default_output_device())
         .ok_or_else(|| anyhow!("не найдено устройство вывода"))?;
 
     let input_name = device_name(&in_dev, "микрофон");
