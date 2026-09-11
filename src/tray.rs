@@ -28,7 +28,7 @@ pub enum Cmd {
 mod imp {
     use super::Cmd;
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-    use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+    use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
     pub struct Tray {
         // Значок должен жить, пока живёт приложение: уронив его, мы уроним
@@ -51,6 +51,10 @@ mod imp {
 
             let icon = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
+                // Меню — только по правой кнопке. Левая должна просто
+                // открывать окно: человек тычет в значок, чтобы увидеть
+                // приложение, а не чтобы прочитать список пунктов.
+                .with_menu_on_left_click(false)
                 .with_tooltip("voicechat")
                 .with_icon(icon)
                 .build()
@@ -63,6 +67,19 @@ mod imp {
         /// поэтому не ждёт: что накопилось, то и отдаём.
         pub fn poll(&self) -> Vec<Cmd> {
             let mut out = Vec::new();
+
+            // Нажатие по самому значку. Левая кнопка открывает окно;
+            // правая сюда не доходит — её забирает меню.
+            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                match event {
+                    TrayIconEvent::Click { button: MouseButton::Left, .. }
+                    | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => {
+                        out.push(Cmd::Show)
+                    }
+                    _ => {}
+                }
+            }
+
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 match event.id.as_ref() {
                     "open" => out.push(Cmd::Show),

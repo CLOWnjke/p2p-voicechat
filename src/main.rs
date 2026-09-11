@@ -5,6 +5,7 @@ mod audio;
 mod identity;
 mod nat;
 mod net;
+mod settings;
 mod tray;
 mod ui;
 
@@ -95,15 +96,32 @@ struct App {
     hidden: bool,
     /// Выходим по-настоящему: закрытие больше не перехватываем.
     quitting: bool,
+    /// Когда вошли в комнату (или начали в неё стучаться). По этому
+    /// на экране ожидания считается, сколько мы уже ждём.
+    active_since: Option<Instant>,
+    /// Раскрыта ли помощь «друг не может подключиться?».
+    show_punch: bool,
+    /// Показывать ли сам код приглашения. По умолчанию нет: человеку
+    /// нужно его отправить, а не прочитать.
+    show_code: bool,
+    /// Настройки, которые переживают закрытие приложения.
+    settings: settings::Settings,
+    /// Когда последний раз писали их на диск. Ползунок за секунду даёт
+    /// сотню изменений, и писать файл на каждое было бы дикостью.
+    saved_at: Instant,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let settings = settings::Settings::load();
+        // Вид выставляем до первой отрисовки: иначе окно моргнёт чужими
+        // цветами на первом кадре.
+        ui::set_theme(settings.theme);
         setup_theme(&cc.egui_ctx);
         Self {
             shared: Arc::new(Mutex::new(net::Shared::default())),
             phase: Phase::Menu,
-            nickname: default_nickname(),
+            nickname: settings.nickname.clone(),
             code_input: String::new(),
             punch_input: String::new(),
             chat_input: String::new(),
@@ -115,7 +133,7 @@ impl App {
             disp: 0.0,
             peak: 0.0,
             last_frame: Instant::now(),
-            devices: audio::DevicePrefs::default(),
+            devices: settings.devices(),
             dev_lists: None,
             identity: Arc::new(identity::Identity::load_or_create()),
             last_room: net::last_room().into_iter().map(|(_, _, n)| n).collect(),
@@ -129,6 +147,32 @@ impl App {
             },
             hidden: false,
             quitting: false,
+            active_since: None,
+            show_punch: false,
+            show_code: false,
+            settings,
+            saved_at: Instant::now(),
+        }
+    }
+
+    /// Сохраняет настройки, если они поменялись. Вызывается каждый кадр:
+    /// сравнение дешёвое, а запись случается не чаще раза в две секунды.
+    fn keep_settings(&mut self, force: bool) {
+        let mut now = self.settings.clone();
+        now.nickname = self.nickname.trim().to_string();
+        now.theme = ui::theme();
+        now.input = self.devices.input.clone();
+        now.output = self.devices.output.clone();
+        if let Some(e) = &self.engine {
+            now.take_from(&e.controls);
+        }
+        if now == self.settings {
+            return;
+        }
+        self.settings = now;
+        if force || self.saved_at.elapsed() > Duration::from_secs(2) {
+            self.settings.save();
+            self.saved_at = Instant::now();
         }
     }
 
@@ -189,8 +233,12 @@ impl App {
                 self.devices.clone(),
             ) {
                 Ok(engine) => {
+                    // Ручки живут в движке и создаются заново на каждый вход,
+                    // поэтому сохранённое расставляем здесь.
+                    self.settings.apply_to(&engine.controls);
                     self.engine = Some(engine);
                     self.phase = Phase::Active;
+                    self.active_since = Some(Instant::now());
                 }
                 Err(e) => {
                     self.error = Some(format!("Звук не запустился: {e}"));
@@ -205,11 +253,15 @@ impl App {
     }
 
     fn leave(&mut self) {
+        self.keep_settings(true);
         self.engine = None; // Drop останавливает потоки и звук
         self.phase = Phase::Menu;
         self.last_room = net::last_room().into_iter().map(|(_, _, n)| n).collect();
         self.punch_input.clear();
         self.chat_input.clear();
+        self.show_code = false;
+        self.show_punch = false;
+        self.active_since = None;
         self.chat_seen = 0;
         self.disp = 0.0;
         self.peak = 0.0;
@@ -302,21 +354,21 @@ impl App {
         };
         ui.add_space(14.0);
         ui.horizontal(|ui| {
-            micro(ui, "НАГРУЗКА", DIM);
+            micro(ui, "НАГРУЗКА", DIM());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 mono(
                     ui,
                     spaced(&format!("{:.0}% ЯДРА", head * 100.0)),
                     9.5,
-                    if head > 0.35 { DANGER } else { FAINT },
+                    if head > 0.35 { DANGER() } else { FAINT() },
                 )
             });
         });
         ui.add_space(6.0);
-        hairline(ui, LINE_DIM);
+        hairline(ui, LINE_DIM());
         ui.add_space(7.0);
         ui.horizontal(|ui| {
-            mono(ui, "", 10.0, DIM);
+            mono(ui, "", 10.0, DIM());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (r, resp) =
                     ui.allocate_exact_size(egui::vec2(62.0, 11.0), egui::Sense::hover());
@@ -325,7 +377,7 @@ impl App {
                     egui::Align2::RIGHT_CENTER,
                     spaced("СЕЙЧАС"),
                     egui::FontId::monospace(9.0),
-                    FAINT,
+                    FAINT(),
                 );
                 resp.on_hover_text("Замер прямо сейчас, когда окно перед вами.");
                 let (r, resp) =
@@ -335,7 +387,7 @@ impl App {
                     egui::Align2::RIGHT_CENTER,
                     spaced("В ИГРЕ"),
                     egui::FontId::monospace(9.0),
-                    ACCENT,
+                    ACCENT(),
                 );
                 resp.on_hover_text(
                     "Последний замер, сделанный пока окно было не в фокусе — то есть \
@@ -379,7 +431,7 @@ impl App {
         for (name, values, hint) in rows {
             ui.add_space(7.0);
             ui.horizontal(|ui| {
-                mono(ui, name, 11.0, TEXT_2);
+                mono(ui, name, 11.0, TEXT_2());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     for (i, v) in values.iter().enumerate() {
                         let (r, _) =
@@ -389,7 +441,7 @@ impl App {
                             egui::Align2::RIGHT_CENTER,
                             v,
                             egui::FontId::monospace(11.0),
-                            if i == 0 { TEXT } else { ACCENT },
+                            if i == 0 { TEXT() } else { ACCENT() },
                         );
                     }
                 });
@@ -399,9 +451,9 @@ impl App {
         }
         ui.add_space(7.0);
         ui.horizontal(|ui| {
-            mono(ui, "пакетов в секунду", 11.0, DIM);
+            mono(ui, "пакетов в секунду", 11.0, DIM());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                mono(ui, format!("{:.0}", self.load_shown[5]), 11.0, DIM);
+                mono(ui, format!("{:.0}", self.load_shown[5]), 11.0, DIM());
             });
         });
         if let Some(at) = self.load_game_at {
@@ -410,7 +462,7 @@ impl App {
                 ui,
                 format!("замер в игре сделан {} с назад", at.elapsed().as_secs()),
                 10.0,
-                FAINT,
+                FAINT(),
             );
         }
     }
@@ -436,6 +488,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let painting = Instant::now();
         self.poll_pending();
+        self.keep_settings(false);
         self.poll_tray(ui.ctx());
 
         // Пока окно не на переднем плане, перерисовываться шестьдесят раз в
@@ -465,7 +518,7 @@ impl eframe::App for App {
         ui.ctx().request_repaint_after(Duration::from_millis(period));
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG))
+            .frame(egui::Frame::new().fill(BG()))
             .show(ui, |ui| {
                 // Шапка и линия под ней — во всю ширину, содержимое — с полями.
                 self.header(ui);
@@ -493,9 +546,9 @@ impl eframe::App for App {
                         if let Some(err) = self.error.clone() {
                             ui.add_space(14.0);
                             ui.horizontal(|ui| {
-                                mono(ui, "!", 11.0, DANGER);
+                                mono(ui, "!", 11.0, DANGER());
                                 ui.add_space(6.0);
-                                mono(ui, err, 11.0, DANGER);
+                                mono(ui, err, 11.0, DANGER());
                             });
                         }
                         ui.add_space(18.0);
@@ -513,6 +566,7 @@ impl eframe::App for App {
     /// не успеть отработать, и человек ещё несколько секунд висел бы
     /// в чужом списке участников.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.keep_settings(true);
         self.engine = None;
     }
 }
@@ -535,19 +589,21 @@ impl App {
                 egui::RichText::new("VOICECHAT")
                     .size(18.0)
                     .strong()
-                    .color(TEXT)
+                    .color(TEXT())
                     .monospace(),
             );
             ui.add_space(6.0);
-            mono(ui, "v0.1", 9.0, FAINT);
+            mono(ui, "v0.1", 9.0, FAINT());
 
             let live = matches!(self.phase, Phase::Active)
                 && self.shared.lock().unwrap().connected;
+            // По-русски и по-человечески: это подпись для человека,
+            // а не отладочный флаг.
             let (label, color) = match self.phase {
-                Phase::Menu => ("IDLE", DIM),
-                Phase::Connecting(_) => ("LINK", DIM),
-                Phase::Active if live => ("LIVE", ACCENT),
-                Phase::Active => ("WAIT", DIM),
+                Phase::Menu => ("НЕ В КОМНАТЕ", DIM()),
+                Phase::Connecting(_) => ("ПОДКЛЮЧАЕМСЯ", DIM()),
+                Phase::Active if live => ("В КОМНАТЕ", ACCENT()),
+                Phase::Active => ("ЖДЁМ", DIM()),
             };
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 mono(ui, spaced(label), 9.5, color);
@@ -573,20 +629,20 @@ impl App {
                             egui::Align2::RIGHT_CENTER,
                             format!("+{unread}"),
                             egui::FontId::monospace(9.5),
-                            ACCENT,
+                            ACCENT(),
                         );
                         resp.on_hover_text("Новые сообщения в чате");
                     }
                 }
                 ui.add_space(6.0);
                 let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
-                if color == ACCENT {
-                    ui.painter().rect_filled(r, egui::CornerRadius::ZERO, ACCENT);
+                if color == ACCENT() {
+                    ui.painter().rect_filled(r, egui::CornerRadius::ZERO, ACCENT());
                 } else {
                     ui.painter().rect_stroke(
                         r,
                         egui::CornerRadius::ZERO,
-                        egui::Stroke::new(1.0, DIMMER),
+                        egui::Stroke::new(1.0, DIMMER()),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -594,16 +650,187 @@ impl App {
         });
             });
         ui.add_space(12.0);
-        hairline(ui, LINE);
+        hairline(ui, LINE());
     }
 
     fn ui_connecting(&mut self, ui: &mut egui::Ui, msg: &str) {
         ui.horizontal(|ui| {
             ui.spinner();
             ui.add_space(6.0);
-            mono(ui, spaced(msg), 11.0, TEXT_2);
+            mono(ui, spaced(msg), 11.0, TEXT_2());
         });
         ui.add_space(16.0);
+        self.log_section(ui);
+    }
+
+    /// Что видит гость, пока не вошёл в комнату.
+    ///
+    /// Две половины одной истории. Пока идёт обычное ожидание — видно,
+    /// какой шаг сейчас выполняется. Когда хост не ответил — та самая
+    /// инструкция, за которой раньше надо было догадаться полезть в
+    /// свёрнутый раздел «Не соединяется». Теперь она и есть экран.
+    fn ui_waiting(
+        &mut self,
+        ui: &mut egui::Ui,
+        status: &str,
+        invite: Option<String>,
+        upnp: Option<String>,
+    ) {
+        let stuck = status.contains("не отвечает");
+        let waited = self
+            .active_since
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+
+        if !stuck {
+            ui.label(
+                egui::RichText::new("Ищем комнату")
+                    .size(20.0)
+                    .color(TEXT())
+                    .monospace(),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "Обычно занимает две-три секунды.\nЕсли дольше — подскажем, что делать.",
+                )
+                .size(11.5)
+                .color(TEXT_2())
+                .monospace(),
+            );
+
+            ui.add_space(24.0);
+            hairline(ui, LINE());
+            ui.add_space(12.0);
+            step_row(ui, Step::Done, "Открыли свой порт", "и попросили роутер пропускать входящие", "готово");
+            ui.add_space(12.0);
+            hairline(ui, LINE_DIM());
+            ui.add_space(12.0);
+            step_row(
+                ui,
+                if invite.is_some() { Step::Done } else { Step::Now },
+                "Узнали свой адрес снаружи",
+                match &upnp {
+                    Some(n) if n.contains("пробросил порт:") => "роутер открыл порт сам",
+                    Some(_) => "роутер порт не открыл — обычно это не мешает",
+                    None => "спрашиваем у публичного сервера",
+                },
+                if invite.is_some() { "готово" } else { "" },
+            );
+            ui.add_space(12.0);
+            hairline(ui, LINE_DIM());
+            ui.add_space(12.0);
+            step_row(ui, Step::Now, "Стучимся к хосту", "пробуем все адреса из кода сразу", &format!("{waited} с"));
+            ui.add_space(12.0);
+            hairline(ui, LINE_DIM());
+            ui.add_space(12.0);
+            step_row(ui, Step::Wait, "Здороваемся и входим", "сверяем ключи и занимаем место", "");
+            ui.add_space(12.0);
+            hairline(ui, LINE());
+
+            ui.add_space(22.0);
+            if button(ui, "ОТМЕНИТЬ", 40.0, None, None, Some(DIMMER()), TEXT_2(), 11.0).clicked() {
+                self.leave();
+                return;
+            }
+            ui.add_space(18.0);
+            self.log_section(ui);
+            return;
+        }
+
+        // --- хост не ответил ---
+        ui.label(
+            egui::RichText::new("Хост не отвечает")
+                .size(20.0)
+                .color(TEXT())
+                .monospace(),
+        );
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new(
+                "Так бывает почти всегда, и это не поломка.\nРоутер друга пропускает к нему только тех,\nкому он писал сам. Значит, надо постучаться\nнавстречу с обеих сторон — это три шага\nи полминуты.",
+            )
+            .size(11.5)
+            .color(TEXT_2())
+            .monospace(),
+        );
+
+        ui.add_space(22.0);
+        hairline(ui, LINE());
+        ui.add_space(16.0);
+
+        numbered(ui, 1, true, "Скопируйте свой код", "он у вас уже есть — приложение сделало его при запуске");
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.add_space(26.0);
+            let just = self
+                .copied_at
+                .map(|t| t.elapsed() < Duration::from_secs(2))
+                .unwrap_or(false);
+            if button(
+                ui,
+                if just { "СКОПИРОВАНО" } else { "СКОПИРОВАТЬ МОЙ КОД" },
+                40.0,
+                None,
+                Some(ACCENT()),
+                None,
+                ON_ACCENT(),
+                11.0,
+            )
+            .clicked()
+            {
+                if let Some(code) = &invite {
+                    ui.ctx().copy_text(code.clone());
+                    self.copied_at = Some(Instant::now());
+                }
+            }
+        });
+
+        ui.add_space(18.0);
+        hairline(ui, LINE_DIM());
+        ui.add_space(16.0);
+        numbered(ui, 2, false, "Отправьте его другу", "туда же, откуда взяли его код: в чат игры,\nв мессенджер, куда угодно");
+
+        ui.add_space(18.0);
+        hairline(ui, LINE_DIM());
+        ui.add_space(16.0);
+        numbered(ui, 3, false, "Пусть он вставит его у себя", "в своём окне он нажмёт «друг не может\nподключиться?» и вставит ваш код");
+
+        ui.add_space(18.0);
+        hairline(ui, LINE());
+        ui.add_space(18.0);
+
+        // Обещание, без которого инструкция неполна: человек должен знать,
+        // что дальше от него ничего не требуется.
+        let frame = egui::Frame::new()
+            .fill(ACCENT_BG())
+            .stroke(egui::Stroke::new(1.0, ACCENT()))
+            .corner_radius(egui::CornerRadius::ZERO)
+            .inner_margin(egui::Margin::symmetric(14, 13))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    egui::RichText::new(
+                        "Ждём его. Как только он вставит код, вы\nсоединитесь сами — нажимать больше\nничего не надо.",
+                    )
+                    .size(11.0)
+                    .color(TEXT_2())
+                    .monospace(),
+                );
+            });
+        let _ = frame;
+
+        ui.add_space(20.0);
+        // Обратный путь: если друг прислал свой код, вставить его можно и
+        // отсюда — постучимся навстречу с обеих сторон сразу.
+        self.show_punch = true;
+        self.help_row(ui);
+        ui.add_space(18.0);
+        if button(ui, "ВЕРНУТЬСЯ НАЗАД", 38.0, None, None, Some(DIMMER()), TEXT_2(), 10.5).clicked() {
+            self.leave();
+            return;
+        }
+        ui.add_space(18.0);
         self.log_section(ui);
     }
 
@@ -612,7 +839,7 @@ impl App {
             egui::RichText::new("ГОЛОС\nБЕЗ СЕРВЕРА")
                 .size(29.0)
                 .strong()
-                .color(TEXT)
+                .color(TEXT())
                 .monospace(),
         );
         ui.add_space(10.0);
@@ -621,7 +848,7 @@ impl App {
                 "Комната живёт на компьютере хоста. Друзья\nподключаются по коду напрямую — между\nвами нет ничего.",
             )
             .size(11.0)
-            .color(DIM)
+            .color(DIM())
             .monospace(),
         );
 
@@ -629,7 +856,7 @@ impl App {
         // только что вылетел, это единственное, чего он хочет.
         if !self.last_room.is_empty() {
             ui.add_space(26.0);
-            micro(ui, "ВЫ УЖЕ БЫЛИ ЗДЕСЬ", DIM);
+            micro(ui, "ВЫ УЖЕ БЫЛИ ЗДЕСЬ", DIM());
             ui.add_space(6.0);
             let who: Vec<&str> = self
                 .last_room
@@ -637,7 +864,7 @@ impl App {
                 .map(|n| n.as_str())
                 .filter(|n| !n.is_empty())
                 .collect();
-            mono(ui, who.join(", "), 11.5, TEXT_2);
+            mono(ui, who.join(", "), 11.5, TEXT_2());
             ui.add_space(10.0);
             if button(
                 ui,
@@ -645,8 +872,8 @@ impl App {
                 40.0,
                 None,
                 None,
-                Some(ACCENT),
-                ACCENT,
+                Some(ACCENT()),
+                ACCENT(),
                 11.5,
             )
             .on_hover_text(
@@ -661,11 +888,11 @@ impl App {
         }
 
         ui.add_space(30.0);
-        micro(ui, "ИМЯ", DIM);
+        micro(ui, "ИМЯ", DIM());
         ui.add_space(6.0);
         field(ui, &mut self.nickname, "как вас зовут", 14.0, 40.0, Some(24));
         ui.add_space(10.0);
-        if button(ui, "СОЗДАТЬ КОМНАТУ", 40.0, None, Some(ACCENT), None, BG, 12.0).clicked() {
+        if button(ui, "СОЗДАТЬ КОМНАТУ", 40.0, None, Some(ACCENT()), None, ON_ACCENT(), 12.0).clicked() {
             self.begin(true);
         }
 
@@ -673,15 +900,15 @@ impl App {
         ui.horizontal(|ui| {
             let w = (ui.available_width() - 40.0) / 2.0;
             let (r1, _) = ui.allocate_exact_size(egui::vec2(w, 1.0), egui::Sense::hover());
-            ui.painter().rect_filled(r1, egui::CornerRadius::ZERO, LINE);
-            mono(ui, spaced("ИЛИ"), 9.5, FAINT);
+            ui.painter().rect_filled(r1, egui::CornerRadius::ZERO, LINE());
+            mono(ui, spaced("ИЛИ"), 9.5, FAINT());
             let (r2, _) =
                 ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-            ui.painter().rect_filled(r2, egui::CornerRadius::ZERO, LINE);
+            ui.painter().rect_filled(r2, egui::CornerRadius::ZERO, LINE());
         });
 
         ui.add_space(20.0);
-        micro(ui, "КОД ПРИГЛАШЕНИЯ", DIM);
+        micro(ui, "КОД ПРИГЛАШЕНИЯ", DIM());
         ui.add_space(6.0);
         field(
             ui,
@@ -698,8 +925,8 @@ impl App {
             40.0,
             None,
             None,
-            Some(DIMMER),
-            TEXT,
+            Some(DIMMER()),
+            TEXT(),
             11.5,
         )
         .clicked()
@@ -707,10 +934,43 @@ impl App {
             self.begin(false);
         }
 
-        ui.add_space(26.0);
+        ui.add_space(28.0);
+        hairline(ui, LINE());
+        ui.add_space(16.0);
+        micro(ui, "ВИД", DIM());
+        ui.add_space(10.0);
+        if theme_picker(ui) {
+            // Цвета egui берутся из палитры один раз, при настройке стиля,
+            // поэтому после смены вида её надо провести заново.
+            setup_theme(ui.ctx());
+            self.keep_settings(true);
+        }
+
+        ui.add_space(22.0);
         self.devices_section(ui);
         ui.add_space(16.0);
-        hairline(ui, LINE_DIM);
+        ui.horizontal_top(|ui| {
+            // Галочку рисуем сами: в моноширинном шрифте egui её нет,
+            // и вместо знака выходит пустой прямоугольник.
+            let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::hover());
+            let p = ui.painter();
+            let st = egui::Stroke::new(1.3, DIM());
+            let c = egui::pos2(r.left() + 5.0, r.top() + 7.0);
+            p.line_segment([c + egui::vec2(-4.0, 0.0), c + egui::vec2(-1.0, 3.0)], st);
+            p.line_segment([c + egui::vec2(-1.0, 3.0), c + egui::vec2(4.5, -3.5)], st);
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(
+                    "имя, вид, устройства и все настройки звука\nсохраняются — заново настраивать не придётся",
+                )
+                .size(10.0)
+                .color(DIM())
+                .monospace(),
+            );
+        });
+
+        ui.add_space(16.0);
+        hairline(ui, LINE_DIM());
         ui.add_space(10.0);
         footer(
             ui,
@@ -752,68 +1012,36 @@ impl App {
             )
         };
 
-        // --- код приглашения ---
+        // Пока гость не вошёл, показывать ему комнату нечестно: комнаты
+        // ещё нет. Вместо неё — что происходит и что делать.
+        let connected = self.shared.lock().unwrap().connected;
+        if !is_host && !connected {
+            self.ui_waiting(ui, &status, invite.clone(), upnp.clone());
+            return;
+        }
+
+        // --- пригласить ---
+        //
+        // Кода здесь больше нет. Человеку незачем видеть строку в двести
+        // знаков: ему нужно её отправить, а не прочитать. Поэтому на виду
+        // только действие, а сам код — за ссылкой, для любопытных.
         if let Some(code) = invite {
-            ui.horizontal(|ui| {
-                micro(
-                    ui,
-                    if is_host {
-                        "КОД ПРИГЛАШЕНИЯ"
-                    } else {
-                        "ВАШ КОД"
-                    },
-                    DIM,
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let n = net::decode_invite(&code).map(|v| v.len()).unwrap_or(0);
-                    let (r, resp) =
-                        ui.allocate_exact_size(egui::vec2(78.0, 12.0), egui::Sense::hover());
-                    ui.painter().text(
-                        r.right_center(),
-                        egui::Align2::RIGHT_CENTER,
-                        spaced(&format!("АДРЕСОВ · {n}")),
-                        egui::FontId::monospace(9.5),
-                        FAINT,
-                    );
-                    resp.on_hover_text(
-                        "В коде несколько адресов: внешний, локальный и петлевой. Приложение стучится во все сразу и остаётся на том, который ответит.",
-                    );
-                });
-            });
-            ui.add_space(6.0);
+            micro(ui, if is_host { "ПРИГЛАСИТЬ" } else { "ВАШ КОД" }, DIM());
+            ui.add_space(10.0);
 
-            let frame = egui::Frame::new()
-                .fill(PANEL)
-                .stroke(egui::Stroke::new(1.0, LINE))
-                .corner_radius(egui::CornerRadius::ZERO)
-                .inner_margin(egui::Margin::symmetric(11, 10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        egui::RichText::new(&code)
-                            .size(11.5)
-                            .color(TEXT_2)
-                            .monospace(),
-                    );
-                });
-            // Засечки рисуем по настоящему прямоугольнику рамки: считать его
-            // по курсору нельзя, туда попадают межэлементные отступы.
-            corner_ticks(ui, frame.response.rect, ACCENT);
-
-            ui.add_space(8.0);
             let just = self
                 .copied_at
                 .map(|t| t.elapsed() < Duration::from_secs(2))
                 .unwrap_or(false);
             if button(
                 ui,
-                if just { "СКОПИРОВАНО" } else { "КОПИРОВАТЬ КОД" },
-                36.0,
+                if just { "СКОПИРОВАНО" } else { "СКОПИРОВАТЬ КОД ПРИГЛАШЕНИЯ" },
+                42.0,
                 None,
+                Some(ACCENT()),
                 None,
-                Some(if just { ACCENT } else { DIMMER }),
-                if just { ACCENT } else { TEXT },
-                11.0,
+                ON_ACCENT(),
+                11.5,
             )
             .clicked()
             {
@@ -822,22 +1050,43 @@ impl App {
             }
 
             ui.add_space(9.0);
-            let (r, resp) =
-                ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
-            ui.painter().text(
-                r.left_center(),
-                egui::Align2::LEFT_CENTER,
-                spaced(&format!("ВАШ КЛЮЧ · {}", self.identity.fingerprint())),
-                egui::FontId::monospace(9.5),
-                FAINT,
-            );
-            resp.on_hover_text(
-                "Отпечаток вашего ключа. Он создаётся один раз и хранится на этом компьютере; собеседники узнают вас именно по нему, а не по имени.",
-            );
+            ui.horizontal(|ui| {
+                mono(ui, "отправьте его другу любым способом", 10.0, DIM());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (r, resp) =
+                        ui.allocate_exact_size(egui::vec2(84.0, 13.0), egui::Sense::click());
+                    ui.painter().text(
+                        r.right_center(),
+                        egui::Align2::RIGHT_CENTER,
+                        if self.show_code { "скрыть код" } else { "показать код" },
+                        egui::FontId::monospace(10.0),
+                        if self.show_code { TEXT_2() } else { DIM() },
+                    );
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.show_code = !self.show_code;
+                    }
+                });
+            });
 
-            if let Some(note) = &upnp {
-                let ok = note.contains("пробросил порт:");
+            if self.show_code {
                 ui.add_space(9.0);
+                let frame = egui::Frame::new()
+                    .fill(PANEL())
+                    .stroke(egui::Stroke::new(1.0, LINE()))
+                    .corner_radius(egui::CornerRadius::ZERO)
+                    .inner_margin(egui::Margin::symmetric(11, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            egui::RichText::new(&code)
+                                .size(11.0)
+                                .color(TEXT_2())
+                                .monospace(),
+                        );
+                    });
+                corner_ticks(ui, frame.response.rect, ACCENT());
+                ui.add_space(6.0);
+                let n = net::decode_invite(&code).map(|v| v.len()).unwrap_or(0);
                 let (r, resp) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), 12.0),
                     egui::Sense::hover(),
@@ -845,26 +1094,22 @@ impl App {
                 ui.painter().text(
                     r.left_center(),
                     egui::Align2::LEFT_CENTER,
-                    spaced(if ok {
-                        "РОУТЕР ОТКРЫЛ ПОРТ"
-                    } else {
-                        "РОУТЕР НЕ ОТКРЫЛ ПОРТ"
-                    }),
+                    spaced(&format!("АДРЕСОВ · {n}")),
                     egui::FontId::monospace(9.5),
-                    if ok { ACCENT } else { DIM },
+                    FAINT(),
                 );
-                resp.on_hover_text(if ok {
-                    "Приложение попросило роутер пропустить входящие пакеты, и он согласился. Друзья должны подключиться по коду с первого раза."
-                } else {
-                    "Роутер не пропускает входящие пакеты сам — либо в нём выключен UPnP, либо он его не умеет.\n\nЭто не поломка: если друг не сможет подключиться, откройте раздел «Не соединяется» и обменяйтесь кодами."
-                });
+                resp.on_hover_text(
+                    "В коде несколько адресов: внешний, локальный и петлевой. Приложение стучится во все сразу и остаётся на том, который ответит.",
+                );
             }
 
+            ui.add_space(12.0);
+            self.help_row(ui);
             ui.add_space(20.0);
         }
 
         if !is_host && !status.is_empty() {
-            mono(ui, spaced(&status.to_uppercase()), 10.5, TEXT_2);
+            mono(ui, spaced(&status.to_uppercase()), 10.5, TEXT_2());
             ui.add_space(14.0);
         }
 
@@ -882,16 +1127,16 @@ impl App {
             .unwrap_or(false);
 
         ui.horizontal(|ui| {
-            micro(ui, "КОМНАТА", DIM);
+            micro(ui, "КОМНАТА", DIM());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                mono(ui, spaced(&format!("{} / 8", peers.len())), 9.5, FAINT);
+                mono(ui, spaced(&format!("{} / 8", peers.len())), 9.5, FAINT());
             });
         });
         ui.add_space(7.0);
-        hairline(ui, LINE);
+        hairline(ui, LINE());
         if peers.is_empty() {
             ui.add_space(9.0);
-            mono(ui, "пока никого", 11.5, DIM);
+            mono(ui, "пока никого", 11.5, DIM());
         }
         let i_mute = self
             .engine
@@ -929,17 +1174,17 @@ impl App {
                 bars(ui, active && !stale, muted);
                 ui.add_space(6.0);
                 let name_color = if stale || muted {
-                    DIM
+                    DIM()
                 } else if me {
-                    TEXT
+                    TEXT()
                 } else {
-                    TEXT_2
+                    TEXT_2()
                 };
                 mono(ui, name.clone(), 12.5, name_color);
 
                 if stale {
                     ui.add_space(6.0);
-                    let resp = micro(ui, "НЕТ СВЯЗИ", DANGER);
+                    let resp = micro(ui, "НЕТ СВЯЗИ", DANGER());
                     resp.on_hover_text(
                         "От этого человека давно ничего не приходит. Обычно связь \
                          восстанавливается сама за несколько секунд; если нет — \
@@ -958,7 +1203,7 @@ impl App {
                         egui::Align2::CENTER_CENTER,
                         "!",
                         egui::FontId::monospace(12.0),
-                        DANGER,
+                        DANGER(),
                     );
                     resp.on_hover_text(
                         "Под этим именем раньше приходил другой ключ. Либо человек переустановил приложение, либо это не он.",
@@ -979,7 +1224,7 @@ impl App {
                         ui.painter().rect_filled(
                             r,
                             egui::CornerRadius::ZERO,
-                            if straight { ACCENT } else { LINE },
+                            if straight { ACCENT() } else { LINE() },
                         );
                         resp.on_hover_text(if straight {
                             "Звук идёт напрямую, минуя хоста."
@@ -996,9 +1241,9 @@ impl App {
                         prints.get(id).cloned().unwrap_or_else(|| "····".into()),
                         egui::FontId::monospace(9.5),
                         if trust.get(id) == Some(&net::Trust::Changed) {
-                            DANGER
+                            DANGER()
                         } else {
-                            FAINT
+                            FAINT()
                         },
                     );
                     resp.on_hover_text(
@@ -1006,7 +1251,7 @@ impl App {
                     );
                     ui.add_space(6.0);
                     if me {
-                        mono(ui, spaced("ВЫ"), 9.5, ACCENT);
+                        mono(ui, spaced("ВЫ"), 9.5, ACCENT());
                     } else if let Some(engine) = &self.engine {
                         // Громкость собеседника прямо в строке, как канальный
                         // фейдер на пульте: двойной щелчок возвращает единицу.
@@ -1024,7 +1269,7 @@ impl App {
                 });
             });
             ui.add_space(7.0);
-            hairline(ui, LINE_DIM);
+            hairline(ui, LINE_DIM());
         }
 
         ui.add_space(20.0);
@@ -1033,9 +1278,8 @@ impl App {
 
         self.chat_section(ui, &peers);
         self.chain_section(ui);
-        self.punch_section(ui);
         self.log_section(ui);
-        hairline(ui, LINE);
+        hairline(ui, LINE());
 
         ui.add_space(18.0);
         if button(
@@ -1044,8 +1288,8 @@ impl App {
             36.0,
             None,
             None,
-            Some(DANGER_LINE),
-            DANGER,
+            Some(DANGER_LINE()),
+            DANGER(),
             10.5,
         )
         .clicked()
@@ -1060,7 +1304,7 @@ impl App {
                 ui,
                 "крестик прячет окно в значок у часов, разговор продолжается.\nзакрыть приложение совсем — из меню значка",
                 10.0,
-                FAINT,
+                FAINT(),
             );
         }
 
@@ -1092,24 +1336,12 @@ impl App {
         let shown = if muted { 0.0 } else { level };
         self.update_meter(shown);
 
-        ui.horizontal(|ui| {
-            micro(ui, "ВХОД", DIM);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let short: String = input_name.chars().take(28).collect();
-                mono(ui, short.to_uppercase(), 9.0, FAINT);
-            });
-        });
-        ui.add_space(8.0);
-        meter(ui, self.disp, self.peak);
-        ui.add_space(4.0);
-        meter_scale(ui);
-        ui.add_space(10.0);
-
+        let _ = input_name;
         let ptt = controls.ptt.load(Ordering::Relaxed);
         let holding = controls.ptt_down.load(Ordering::Relaxed);
 
         if muted {
-            if button(ui, "ВКЛЮЧИТЬ МИКРОФОН", 40.0, None, None, Some(DIMMER), TEXT, 11.0)
+            if button(ui, "ВКЛЮЧИТЬ МИКРОФОН", 40.0, None, None, Some(DIMMER()), TEXT(), 11.0)
                 .clicked()
             {
                 controls.muted.store(false, Ordering::Relaxed);
@@ -1128,16 +1360,16 @@ impl App {
                 &label,
                 40.0,
                 None,
-                if holding { Some(ACCENT) } else { None },
-                if holding { None } else { Some(DIMMER) },
-                if holding { BG } else { DIM },
+                if holding { Some(ACCENT()) } else { None },
+                if holding { None } else { Some(DIMMER()) },
+                if holding { ON_ACCENT() } else { DIM() },
                 11.0,
             )
             .clicked()
             {
                 controls.muted.store(true, Ordering::Relaxed);
             }
-        } else if button(ui, "ВЫКЛЮЧИТЬ МИКРОФОН", 40.0, None, Some(ACCENT), None, BG, 11.0)
+        } else if button(ui, "ВЫКЛЮЧИТЬ МИКРОФОН", 40.0, None, Some(ACCENT()), None, ON_ACCENT(), 11.0)
             .clicked()
         {
             controls.muted.store(true, Ordering::Relaxed);
@@ -1155,7 +1387,7 @@ impl App {
             ui,
             "devices",
             "УСТРОЙСТВА",
-            Some((&short.to_uppercase(), FAINT)),
+            Some((&short.to_uppercase(), FAINT())),
         );
 
         state.show_body_unindented(ui, |ui| {
@@ -1168,22 +1400,22 @@ impl App {
             ui.label(
                 egui::RichText::new("Меняется только до входа в комнату.")
                     .size(10.0)
-                    .color(DIM)
+                    .color(DIM())
                     .monospace(),
             );
             ui.add_space(12.0);
 
-            micro(ui, "МИКРОФОН", DIM);
+            micro(ui, "МИКРОФОН", DIM());
             ui.add_space(5.0);
             device_list(ui, &ins, &mut self.devices.input, "in");
             ui.add_space(14.0);
 
-            micro(ui, "ВЫВОД", DIM);
+            micro(ui, "ВЫВОД", DIM());
             ui.add_space(5.0);
             device_list(ui, &outs, &mut self.devices.output, "out");
 
             ui.add_space(10.0);
-            if button(ui, "ОБНОВИТЬ СПИСОК", 30.0, None, None, Some(LINE), DIM, 10.0).clicked() {
+            if button(ui, "ОБНОВИТЬ СПИСОК", 30.0, None, None, Some(LINE()), DIM(), 10.0).clicked() {
                 self.dev_lists = Some(audio::list_devices());
             }
             ui.add_space(12.0);
@@ -1204,17 +1436,39 @@ impl App {
             ui,
             "chain",
             "ОБРАБОТКА ЗВУКА",
-            Some((&tag, if on > 0 { ACCENT } else { FAINT })),
+            Some((&tag, if on > 0 { ACCENT() } else { FAINT() })),
         );
 
         state.show_body_unindented(ui, |ui| {
             let (mut aec, mut denoise, mut gate) = (aec0, dn0, gt0);
 
             ui.add_space(12.0);
+
+            // Шкала стоит здесь, а не в комнате: сама по себе она человеку
+            // ничего не говорит, а рядом с ручками показывает, что они
+            // делают со звуком.
+            ui.horizontal(|ui| {
+                micro(ui, "ВХОД", DIM());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let name = self.shared.lock().unwrap().input_name.clone();
+                    let short: String = name.chars().take(28).collect();
+                    mono(ui, short.to_uppercase(), 9.0, FAINT());
+                });
+            });
+            ui.add_space(8.0);
+            meter(ui, self.disp, self.peak);
+            ui.add_space(4.0);
+            meter_scale(ui);
+            ui.add_space(6.0);
+            mono(ui, "это то, что слышат остальные — уже после обработки", 10.0, DIM());
+            ui.add_space(16.0);
+            hairline(ui, LINE());
+            ui.add_space(12.0);
+
             chain(ui, aec, denoise, gate);
             self.load_section(ui);
             ui.add_space(16.0);
-            hairline(ui, LINE);
+            hairline(ui, LINE());
             ui.add_space(10.0);
 
             if toggle_row(
@@ -1227,7 +1481,7 @@ impl App {
                 c.aec.store(aec, Ordering::Relaxed);
             }
             ui.add_space(10.0);
-            hairline(ui, LINE_DIM);
+            hairline(ui, LINE_DIM());
             ui.add_space(10.0);
 
             if toggle_row(
@@ -1244,7 +1498,7 @@ impl App {
                 c.denoise.store(denoise, Ordering::Relaxed);
             }
             ui.add_space(10.0);
-            hairline(ui, LINE_DIM);
+            hairline(ui, LINE_DIM());
             ui.add_space(10.0);
 
             if toggle_row(
@@ -1258,7 +1512,7 @@ impl App {
             }
 
             ui.add_space(10.0);
-            hairline(ui, LINE_DIM);
+            hairline(ui, LINE_DIM());
             ui.add_space(10.0);
 
             let mut ptt = c.ptt.load(Ordering::Relaxed);
@@ -1285,9 +1539,9 @@ impl App {
                             key,
                             24.0,
                             Some(key.len() as f32 * 7.5 + 22.0),
-                            if on { Some(ACCENT) } else { None },
-                            if on { None } else { Some(LINE) },
-                            if on { BG } else { TEXT_2 },
+                            if on { Some(ACCENT()) } else { None },
+                            if on { None } else { Some(LINE()) },
+                            if on { BG() } else { TEXT_2() },
                             9.5,
                         )
                         .clicked()
@@ -1331,14 +1585,14 @@ impl App {
                 ui.horizontal(|ui| {
                     let (r, _) =
                         ui.allocate_exact_size(egui::vec2(1.0, 30.0), egui::Sense::hover());
-                    ui.painter().rect_filled(r, egui::CornerRadius::ZERO, DIMMER);
+                    ui.painter().rect_filled(r, egui::CornerRadius::ZERO, DIMMER());
                     ui.add_space(9.0);
                     ui.label(
                         egui::RichText::new(
                             "Пропадает начало фраз — поднимите чувствительность.\nПроходят хлопки — опустите.",
                         )
                         .size(10.0)
-                        .color(DIM)
+                        .color(DIM())
                         .monospace(),
                     );
                 });
@@ -1362,7 +1616,7 @@ impl App {
             ui,
             "chat",
             "ЧАТ",
-            Some((&tag, if unread > 0 { ACCENT } else { FAINT })),
+            Some((&tag, if unread > 0 { ACCENT() } else { FAINT() })),
         );
 
         // Пока секция открыта, всё прочитано.
@@ -1372,6 +1626,24 @@ impl App {
 
         state.show_body_unindented(ui, |ui| {
             ui.add_space(8.0);
+
+            // Отпечаток ключа переехал сюда из комнаты: смотреть на него
+            // каждый раз незачем, а когда понадобится сверить — он здесь,
+            // вместе со всем остальным техническим.
+            let (r, resp) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 13.0), egui::Sense::hover());
+            ui.painter().text(
+                r.left_center(),
+                egui::Align2::LEFT_CENTER,
+                spaced(&format!("ВАШ КЛЮЧ · {}", self.identity.fingerprint())),
+                egui::FontId::monospace(9.5),
+                FAINT(),
+            );
+            resp.on_hover_text(
+                "Отпечаток вашего ключа. Он создаётся один раз и хранится на этом компьютере; собеседники узнают вас именно по нему, а не по имени.",
+            );
+            ui.add_space(8.0);
+
             egui::ScrollArea::vertical()
                 .max_height(300.0)
                 // Без этого область ужимается по содержимому, и полоса
@@ -1382,7 +1654,7 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     if chat.is_empty() {
-                        mono(ui, "пока пусто", 11.0, FAINT);
+                        mono(ui, "пока пусто", 11.0, FAINT());
                     }
                     for (id, text) in &chat {
                         let name = peers
@@ -1402,13 +1674,13 @@ impl App {
                                 egui::Align2::RIGHT_TOP,
                                 short,
                                 egui::FontId::monospace(11.0),
-                                if *id == my_id { ACCENT } else { DIM },
+                                if *id == my_id { ACCENT() } else { DIM() },
                             );
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(text)
                                         .size(12.0)
-                                        .color(TEXT_2)
+                                        .color(TEXT_2())
                                         .monospace(),
                                 )
                                 .wrap(),
@@ -1423,7 +1695,7 @@ impl App {
             let entered =
                 resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.add_space(8.0);
-            let clicked = button(ui, "ОТПРАВИТЬ", 34.0, None, None, Some(DIMMER), TEXT, 10.5)
+            let clicked = button(ui, "ОТПРАВИТЬ", 34.0, None, None, Some(DIMMER()), TEXT(), 10.5)
                 .clicked();
 
             if entered || clicked {
@@ -1439,41 +1711,79 @@ impl App {
         });
     }
 
-    fn punch_section(&mut self, ui: &mut egui::Ui) {
-        let mut state = section(ui, "trouble", "НЕ СОЕДИНЯЕТСЯ", None);
-        state.show_body_unindented(ui, |ui| {
-            ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new(
-                    "Попросите код у собеседника и вставьте сюда —\nначнём стучаться навстречу, и роутеры откроют\nпуть с обеих сторон.",
-                )
-                .size(10.5)
-                .color(DIM)
-                .monospace(),
-            );
-            ui.add_space(10.0);
-            field(ui, &mut self.punch_input, "код собеседника", 12.5, 36.0, None);
-            ui.add_space(8.0);
-            if button(ui, "ПРОБИТЬ", 36.0, None, None, Some(DIMMER), TEXT, 11.0).clicked() {
-                let code = self.punch_input.trim().to_string();
-                if let Some(engine) = &self.engine {
-                    match engine.add_punch_targets(&code) {
-                        Ok(_) => {
-                            self.punch_input.clear();
-                            self.error = None;
-                        }
-                        Err(e) => self.error = Some(e.to_string()),
+    /// Строка «друг не может подключиться?» рядом с приглашением.
+    ///
+    /// Помощь должна лежать там, где возникает вопрос. Раньше она была
+    /// свёрнутым разделом в самом низу, и догадаться заглянуть туда мог
+    /// только тот, кто и так знает, что ищет.
+    fn help_row(&mut self, ui: &mut egui::Ui) {
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+        let open = self.show_punch;
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::ZERO,
+            egui::Stroke::new(1.0, if open || resp.hovered() { DIMMER() } else { LINE() }),
+            egui::StrokeKind::Inside,
+        );
+        // Кружок с вопросительным знаком, нарисованный вручную.
+        let c = egui::pos2(rect.left() + 17.0, rect.center().y);
+        ui.painter()
+            .circle_stroke(c, 6.5, egui::Stroke::new(1.0, if open { ACCENT() } else { DIM() }));
+        ui.painter().text(
+            c,
+            egui::Align2::CENTER_CENTER,
+            "?",
+            egui::FontId::monospace(9.0),
+            if open { ACCENT() } else { DIM() },
+        );
+        ui.painter().text(
+            egui::pos2(rect.left() + 32.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            "друг не может подключиться?",
+            egui::FontId::monospace(10.5),
+            if open { TEXT() } else { TEXT_2() },
+        );
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            self.show_punch = !self.show_punch;
+        }
+
+        if !self.show_punch {
+            return;
+        }
+
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new(
+                "Роутер друга пропускает к нему только тех, кому\nон писал сам. Попросите у него его код, вставьте\nсюда — и мы постучимся навстречу.",
+            )
+            .size(10.5)
+            .color(DIM())
+            .monospace(),
+        );
+        ui.add_space(10.0);
+        field(ui, &mut self.punch_input, "код друга", 12.5, 38.0, None);
+        ui.add_space(8.0);
+        if button(ui, "ПОСТУЧАТЬСЯ НАВСТРЕЧУ", 38.0, None, None, Some(DIMMER()), TEXT(), 11.0)
+            .clicked()
+        {
+            let code = self.punch_input.trim().to_string();
+            if let Some(engine) = &self.engine {
+                match engine.add_punch_targets(&code) {
+                    Ok(_) => {
+                        self.punch_input.clear();
+                        self.error = None;
                     }
+                    Err(e) => self.error = Some(e.to_string()),
                 }
             }
-            ui.add_space(16.0);
-        });
+        }
     }
 
     fn log_section(&mut self, ui: &mut egui::Ui) {
         let lines = self.shared.lock().unwrap().log.clone();
         let tag = lines.len().to_string();
-        let mut state = section(ui, "log", "ЖУРНАЛ", Some((&tag, FAINT)));
+        let mut state = section(ui, "log", "ЖУРНАЛ", Some((&tag, FAINT())));
         state.show_body_unindented(ui, |ui| {
             ui.add_space(8.0);
             egui::ScrollArea::vertical()
@@ -1485,7 +1795,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(line)
                                 .size(10.0)
-                                .color(DIM)
+                                .color(DIM())
                                 .monospace(),
                         );
                         ui.add_space(2.0);
@@ -1515,7 +1825,7 @@ fn footer(ui: &mut egui::Ui, items: [(&str, &str); 3]) {
                 anchor,
                 spaced(text),
                 egui::FontId::monospace(8.5),
-                if resp.hovered() { DIM } else { FAINT },
+                if resp.hovered() { DIM() } else { FAINT() },
             );
             resp.on_hover_text(*tip);
         }
@@ -1538,12 +1848,12 @@ fn device_list(ui: &mut egui::Ui, items: &[String], picked: &mut Option<String>,
             egui::vec2(8.0, 8.0),
         );
         if selected {
-            ui.painter().rect_filled(mark, egui::CornerRadius::ZERO, ACCENT);
+            ui.painter().rect_filled(mark, egui::CornerRadius::ZERO, ACCENT());
         } else {
             ui.painter().rect_stroke(
                 mark,
                 egui::CornerRadius::ZERO,
-                egui::Stroke::new(1.0, if hovered { DIMMER } else { LINE }),
+                egui::Stroke::new(1.0, if hovered { DIMMER() } else { LINE() }),
                 egui::StrokeKind::Inside,
             );
         }
@@ -1552,7 +1862,7 @@ fn device_list(ui: &mut egui::Ui, items: &[String], picked: &mut Option<String>,
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::monospace(12.0),
-            if selected { TEXT } else { TEXT_2 },
+            if selected { TEXT() } else { TEXT_2() },
         );
         resp.clicked()
     };
@@ -1580,11 +1890,11 @@ fn bars(ui: &mut egui::Ui, active: bool, muted: bool) {
         [3.0, 3.0, 3.0]
     };
     let color = if muted {
-        LINE_DIM
+        LINE_DIM()
     } else if active {
-        ACCENT
+        ACCENT()
     } else {
-        LINE
+        LINE()
     };
     for (i, h) in heights.iter().enumerate() {
         let x = rect.left() + i as f32 * 5.0;
@@ -1600,7 +1910,7 @@ fn bars(ui: &mut egui::Ui, active: bool, muted: bool) {
                 egui::pos2(rect.left() - 1.0, rect.bottom() + 1.0),
                 egui::pos2(rect.right() + 1.0, rect.top() - 1.0),
             ],
-            egui::Stroke::new(1.0, DIM),
+            egui::Stroke::new(1.0, DIM()),
         );
         resp.on_hover_text("Микрофон выключен");
     }
@@ -1619,15 +1929,15 @@ fn setup_theme(ctx: &egui::Context) {
         }
 
         let v = &mut s.visuals;
-        v.panel_fill = BG;
-        v.window_fill = BG;
-        v.extreme_bg_color = PANEL;
-        v.faint_bg_color = PANEL;
-        v.override_text_color = Some(TEXT);
-        v.selection.bg_fill = ACCENT.gamma_multiply(0.35);
-        v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
-        v.hyperlink_color = ACCENT;
-        v.window_stroke = egui::Stroke::new(1.0, LINE);
+        v.panel_fill = BG();
+        v.window_fill = BG();
+        v.extreme_bg_color = PANEL();
+        v.faint_bg_color = PANEL();
+        v.override_text_color = Some(TEXT());
+        v.selection.bg_fill = ACCENT().gamma_multiply(0.35);
+        v.selection.stroke = egui::Stroke::new(1.0, ACCENT());
+        v.hyperlink_color = ACCENT();
+        v.window_stroke = egui::Stroke::new(1.0, LINE());
 
         for w in [
             &mut v.widgets.noninteractive,
@@ -1637,14 +1947,14 @@ fn setup_theme(ctx: &egui::Context) {
             &mut v.widgets.open,
         ] {
             w.corner_radius = egui::CornerRadius::ZERO;
-            w.bg_fill = PANEL;
-            w.weak_bg_fill = PANEL;
-            w.bg_stroke = egui::Stroke::new(1.0, LINE);
-            w.fg_stroke = egui::Stroke::new(1.0, TEXT);
+            w.bg_fill = PANEL();
+            w.weak_bg_fill = PANEL();
+            w.bg_stroke = egui::Stroke::new(1.0, LINE());
+            w.fg_stroke = egui::Stroke::new(1.0, TEXT());
             w.expansion = 0.0;
         }
-        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, DIMMER);
-        v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, DIMMER());
+        v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT());
     });
 }
 
@@ -1696,11 +2006,3 @@ fn icon_rgba() -> (Vec<u8>, u32, u32) {
     (rgba, S as u32, S as u32)
 }
 
-fn default_nickname() -> String {
-    std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .unwrap_or_else(|_| "Игрок".into())
-        .chars()
-        .take(24)
-        .collect()
-}
