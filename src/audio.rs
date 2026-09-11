@@ -269,8 +269,12 @@ pub struct Controls {
     pub gate_sensitivity: Level,
     /// Нижний порог громкости: тише него не пропускаем даже похожее на речь.
     pub gate_floor: Level,
-    /// Модель шумоподавления загружается в фоне ~полсекунды.
+    /// Модель шумоподавления загружается ~полсекунды при входе в комнату.
     pub dfn_ready: Arc<AtomicBool>,
+    /// Загрузка закончилась — неважно, удачей или нет. Без этого метка в
+    /// окне навсегда оставалась «ЗАГРУЗКА…», хотя ничего уже не грузилось
+    /// и работал запасной RNNoise.
+    pub dfn_done: Arc<AtomicBool>,
     /// Уровень уже обработанного сигнала — так видно, что шумодав делает.
     pub level: Level,
     /// Оценка «сейчас говорят», которую RNNoise выдаёт заодно с очисткой.
@@ -302,6 +306,7 @@ impl Controls {
             gate_sensitivity: Arc::new(AtomicU32::new(0.5f32.to_bits())),
             gate_floor: Arc::new(AtomicU32::new(0.02f32.to_bits())),
             dfn_ready: Arc::new(AtomicBool::new(false)),
+            dfn_done: Arc::new(AtomicBool::new(false)),
             level: Arc::new(AtomicU32::new(0)),
             voice: Arc::new(AtomicU32::new(0)),
             ptt: Arc::new(AtomicBool::new(false)),
@@ -581,6 +586,8 @@ fn spawn_processing(
                 None
             }
         };
+        controls.dfn_done.store(true, Ordering::Relaxed);
+
         let mut dfn_in = Array2::<f32>::zeros((1, DENOISE_FRAME));
         let mut dfn_out = Array2::<f32>::zeros((1, DENOISE_FRAME));
 

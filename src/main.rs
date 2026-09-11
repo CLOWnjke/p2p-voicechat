@@ -471,7 +471,7 @@ impl App {
                     format!("{:.0}", self.load_shown[4]),
                     format!("{:.0}", self.load_game[4]),
                 ],
-                "Сколько раз в секунду окно перерисовывается. В фокусе — около шестидесяти, за игрой должно упасть до четырёх, свёрнутым — до одного.",
+                "Сколько раз в секунду окно перерисовывается. В фокусе — около шестидесяти, за игрой должно упасть до четырёх, свёрнутым или спрятанным в значок — до двух.",
             ),
         ];
         for (name, values, hint) in rows {
@@ -724,7 +724,17 @@ impl App {
         );
         ui.add_space(24.0);
         hairline(ui, LINE());
-        self.step(ui, Step::Now, "Открываем свой порт", "и просим роутер пропускать входящие", "");
+        self.step(
+            ui,
+            Step::Now,
+            "Открываем свой порт",
+            if host {
+                "и просим роутер пропускать входящие"
+            } else {
+                "он понадобится, чтобы нас было слышно"
+            },
+            "",
+        );
         self.step(ui, Step::Wait, "Узнаём свой адрес снаружи", "спрашиваем у публичного сервера", "");
         if !host {
             self.step(ui, Step::Wait, "Стучимся к хосту", "пробуем все адреса из кода сразу", "");
@@ -794,7 +804,7 @@ impl App {
             );
             ui.add_space(24.0);
             hairline(ui, LINE());
-            self.step(ui, Step::Done, "Открыли свой порт", "и попросили роутер пропускать входящие", "готово");
+            self.step(ui, Step::Done, "Открыли свой порт", "он понадобится, чтобы нас было слышно", "готово");
             self.step(
                 ui,
                 if invite.is_some() { Step::Done } else { Step::Now },
@@ -1211,7 +1221,12 @@ impl App {
         ui.horizontal(|ui| {
             micro(ui, "КОМНАТА", DIM());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                mono(ui, spaced(&format!("{} / 8", peers.len())), 9.5, FAINT());
+                mono(
+                    ui,
+                    spaced(&format!("{} / {}", peers.len(), net::MAX_PEERS)),
+                    9.5,
+                    FAINT(),
+                );
             });
         });
         ui.add_space(7.0);
@@ -1573,6 +1588,10 @@ impl App {
                 "ШУМОПОДАВЛЕНИЕ",
                 if c.dfn_ready.load(Ordering::Relaxed) {
                     "DEEPFILTERNET 3"
+                } else if c.dfn_done.load(Ordering::Relaxed) {
+                    // Модель не загрузилась — честно говорим, что работает
+                    // запасной, а не показываем вечную «загрузку».
+                    "RNNOISE"
                 } else {
                     "ЗАГРУЗКА…"
                 },
