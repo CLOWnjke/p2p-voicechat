@@ -11,6 +11,10 @@
 //! библиотека тянет за собой GTK. Всё остальное собирается и работает без
 //! него — в этом случае крестик просто закрывает приложение, как раньше.
 
+/// Очередь нажатий: её наполняет поток наблюдения, разбирает поток
+/// отрисовки.
+pub type Queue = std::sync::Arc<std::sync::Mutex<Vec<Cmd>>>;
+
 /// Что человек попросил через значок.
 // На системах без значка ничего из этого не создаётся — это нормально.
 #[allow(dead_code)]
@@ -63,10 +67,19 @@ mod imp {
             Some(Self { _icon: icon })
         }
 
-        /// Забирает накопившиеся нажатия. Вызывается из потока отрисовки,
-        /// поэтому не ждёт: что накопилось, то и отдаём.
-        pub fn poll(&self) -> Vec<Cmd> {
-            let mut out = Vec::new();
+    }
+
+    /// Поток, который слушает значок и будит окно.
+    ///
+    /// Раньше события разбирались в отрисовке — а спрятанное окно
+    /// перерисовывается раз в секунду, и нажатие столько же и ждало.
+    /// Отсюда и «надо укликаться». Поток видит нажатие за сорок
+    /// миллисекунд и сам просит окно проснуться.
+    pub fn spawn_watcher(wake: impl Fn() + Send + 'static) -> super::Queue {
+        let queue: super::Queue = Default::default();
+        let mine = queue.clone();
+        std::thread::spawn(move || loop {
+            let mut got = Vec::new();
 
             // Нажатие по самому значку. Левая кнопка открывает окно;
             // правая сюда не доходит — её забирает меню.
@@ -74,7 +87,7 @@ mod imp {
                 match event {
                     TrayIconEvent::Click { button: MouseButton::Left, .. }
                     | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => {
-                        out.push(Cmd::Show)
+                        got.push(Cmd::Show)
                     }
                     _ => {}
                 }
@@ -82,21 +95,25 @@ mod imp {
 
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 match event.id.as_ref() {
-                    "open" => out.push(Cmd::Show),
-                    "mute" => out.push(Cmd::ToggleMute),
-                    "quit" => out.push(Cmd::Quit),
+                    "open" => got.push(Cmd::Show),
+                    "mute" => got.push(Cmd::ToggleMute),
+                    "quit" => got.push(Cmd::Quit),
                     _ => {}
                 }
             }
-            out
-        }
+
+            if !got.is_empty() {
+                mine.lock().unwrap().extend(got);
+                wake();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        });
+        queue
     }
 }
 
 #[cfg(not(all(windows, feature = "tray")))]
 mod imp {
-    use super::Cmd;
-
     /// Заглушка для систем без значка. Ничего не создаёт — и приложение
     /// ведёт себя как раньше: крестик закрывает.
     pub struct Tray;
@@ -105,11 +122,11 @@ mod imp {
         pub fn new(_rgba: Vec<u8>, _w: u32, _h: u32) -> Option<Self> {
             None
         }
+    }
 
-        pub fn poll(&self) -> Vec<Cmd> {
-            Vec::new()
-        }
+    pub fn spawn_watcher(_wake: impl Fn() + Send + 'static) -> super::Queue {
+        Default::default()
     }
 }
 
-pub use imp::Tray;
+pub use imp::{spawn_watcher, Tray};

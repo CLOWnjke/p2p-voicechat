@@ -44,16 +44,14 @@ fn query_one(sock: &UdpSocket, server: &str) -> Result<SocketAddr> {
         .find(|a| a.is_ipv4())
         .ok_or_else(|| anyhow!("{server}: не удалось разрешить имя"))?;
 
-    // Транзакционный идентификатор: 12 псевдослучайных байт.
-    let mut txid = [0u8; 12];
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x1234_5678)
-        ^ (sock as *const _ as u64);
-    for (i, b) in txid.iter_mut().enumerate() {
-        *b = ((seed >> ((i % 8) * 8)) as u8) ^ (i as u8).wrapping_mul(31);
-    }
+    // Идентификатор запроса: двенадцать случайных байт.
+    //
+    // Раньше они строились из времени и адреса объекта в памяти. Ответ
+    // принимается по совпадению этого идентификатора, а значит тот, кто
+    // угадает момент запуска и подделает обратный адрес, мог навязать нам
+    // чужой «внешний адрес» — а он уходит в код приглашения и в состав
+    // комнаты. Чинится одной строкой, так что чиним.
+    let txid = crate::identity::random_bytes::<12>()?;
 
     // Заголовок STUN Binding Request: 20 байт.
     let mut req = Vec::with_capacity(20);

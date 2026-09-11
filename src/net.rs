@@ -29,10 +29,14 @@ pub use crate::identity::Trust;
 use crate::nat;
 
 const MAGIC: [u8; 2] = *b"VC";
-// Версия 4: комната переживает уход хоста — оставшиеся выбирают нового.
+// Версия 5: опознание стало взаимным. Раньше подпись предъявлял только
+// гость, а хост — нет, и любой, кто видел код приглашения, мог хостом
+// притвориться: код полупубличный, его пересылают в переписке. Теперь
+// обе стороны подписывают задачу друг друга.
+//
 // Со старыми сборками намеренно несовместимо — лучше не соединиться, чем
 // разбирать чужой формат и выдавать кашу.
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 
 const T_HELLO: u8 = 0x01;
 const T_WELCOME: u8 = 0x02;
@@ -55,6 +59,13 @@ const T_AUTH: u8 = 0x0A;
 const T_HOST: u8 = 0x0B;
 
 const HOST_ID: u16 = 1;
+/// Сколько человек пускаем в комнату. Ограничение не от жадности:
+/// без него поток HELLO со случайными ключами набивал таблицу без предела.
+const MAX_PEERS: usize = 16;
+/// Сколько собеседников держим в памяти на приёме. Раньше на каждый номер
+/// из тела звукового пакета заводился свой декодер и своя дорожка микшера,
+/// и посторонний мог развести их шестьдесят пять тысяч.
+const MAX_STREAMS: usize = 32;
 /// Через сколько молчания считаем, что человека больше нет.
 const PEER_TIMEOUT: Duration = Duration::from_secs(8);
 /// Через сколько молчания хоста считаем связь потерянной и начинаем
@@ -207,6 +218,10 @@ struct Room {
     roster: Mutex<Vec<RosterEntry>>,
     /// Хост попрощался явно — ждать двенадцать секунд тишины незачем.
     host_gone: AtomicBool,
+    /// Случайная задача, которую мы отправляем в HELLO и которую хост
+    /// обязан подписать в ответ. Без неё хостом мог притвориться любой,
+    /// кто видел код приглашения: открытый ключ в нём и лежит.
+    my_challenge: Mutex<[u8; 16]>,
     /// Мы уже были в комнате. Пока нет — тишина означает, что мы просто не
     /// дозвонились, и выбирать нового хоста не из чего: состав, поднятый
     /// из памяти, это лишь список тех, к кому мы стучимся.
@@ -274,10 +289,15 @@ struct Peer {
     public: [u8; 32],
     /// Случайная строка, которую мы отправили и ждём подписанной обратно.
     challenge: [u8; 16],
-    /// Новый адрес, с которого человек постучался. Переезжаем на него
-    /// только после того, как он подпишет свежую задачу: иначе чужой,
-    /// знающий открытый ключ, мог бы увести на себя чужой звук.
-    pending_addr: Option<SocketAddr>,
+    /// Адреса, с которых постучались тем же ключом, и выданные им задачи.
+    ///
+    /// Переезжаем только на тот адрес, что подпишет свою задачу: иначе
+    /// чужой, знающий открытый ключ, увёл бы на себя чужой звук. А задача
+    /// на каждый адрес своя и не перевыдаётся — раньше одна общая задача
+    /// перевыпускалась на каждый стук, и достаточно было слать стук чужим
+    /// открытым ключом (он публичен), чтобы человек не мог войти никогда:
+    /// его подпись всё время оказывалась под уже устаревшей задачей.
+    pending: HashMap<SocketAddr, [u8; 16]>,
     /// Подпись сошлась: это точно владелец ключа, а не тот, кто его скопировал.
     verified: bool,
     joined: Instant,
@@ -578,6 +598,7 @@ impl Engine {
             my_addr: Mutex::new(host_addr),
             roster: Mutex::new(seed),
             host_gone: AtomicBool::new(false),
+            my_challenge: Mutex::new(identity::random_bytes::<16>()?),
             joined: AtomicBool::new(is_host),
         });
         let (chat_tx, chat_rx) = sync_channel::<String>(32);
@@ -798,6 +819,10 @@ fn encode_addr(a: Option<SocketAddr>) -> [u8; 6] {
 }
 
 fn decode_addr(b: &[u8]) -> Option<SocketAddr> {
+    // Проверяем длину здесь, а не надеемся на вызывающего: сегодня все
+    // места безопасны, но любое новое обращение с коротким срезом уронило
+    // бы приложение.
+    let b = b.get(..6)?;
     let port = u16::from_be_bytes([b[4], b[5]]);
     if port == 0 {
         return None;
@@ -812,8 +837,16 @@ fn encode_peers(roster: &[RosterEntry]) -> Vec<u8> {
     let mut msg = header(T_PEERS);
     msg.push(roster.len().min(255) as u8);
     for (id, name, pk, addr) in roster.iter().take(255) {
-        let bytes = name.as_bytes();
-        let len = bytes.len().min(64);
+        // Режем по границе знака, а не по байту: иначе у всех в списке
+        // будет имя с мусорным хвостом.
+        let cut = name
+            .char_indices()
+            .map(|(i, c)| i + c.len_utf8())
+            .take_while(|i| *i <= 64)
+            .last()
+            .unwrap_or(0);
+        let bytes = &name.as_bytes()[..cut];
+        let len = bytes.len();
         msg.extend_from_slice(&id.to_be_bytes());
         msg.extend_from_slice(pk);
         msg.extend_from_slice(&encode_addr(*addr));
@@ -934,6 +967,9 @@ fn follow_host(
     *room.expect_host.lock().unwrap() = Some(public);
     *room.targets.lock().unwrap() = vec![addr];
     *locked.lock().unwrap() = None;
+    if let Ok(fresh) = identity::random_bytes::<16>() {
+        *room.my_challenge.lock().unwrap() = fresh;
+    }
     *host_seen.lock().unwrap() = Instant::now();
 
     let mut s = shared.lock().unwrap();
@@ -974,19 +1010,22 @@ fn become_host(
                 continue;
             }
             let Some(a) = addr else { continue };
+            let Ok(challenge) = identity::random_bytes::<16>() else {
+                continue;
+            };
             t.peers.push(Peer {
                 id: *id,
                 name: name.clone(),
                 addr: *a,
                 last_seen: Instant::now(),
                 public: *pk,
-                challenge: identity::random_bytes::<16>(),
-                pending_addr: None,
+                challenge,
+                pending: HashMap::new(),
                 verified: false,
                 joined: Instant::now(),
             });
         }
-        t.next_id = max.wrapping_add(1);
+        t.next_id = max.saturating_add(1);
     }
 
     room.is_host.store(true, Ordering::Relaxed);
@@ -1050,6 +1089,57 @@ fn elect(room: &RoomRef, shared: &Arc<Mutex<Shared>>, my_id: u16) -> Option<Rost
         .collect();
     alive.sort_by_key(|(id, _, _, _)| *id);
     alive.into_iter().next()
+}
+
+/// Что именно подписывает хост в ответе на стук.
+///
+/// Не голая задача, а задача вместе с назначением и номерами. Без метки
+/// назначения подпись из одного места протокола можно предъявить в
+/// другом: и там, и там это были просто шестнадцать байт.
+fn welcome_msg(ask: &[u8], host_id: u16, guest_id: u16) -> Vec<u8> {
+    let mut m = Vec::with_capacity(ask.len() + 14);
+    m.extend_from_slice(b"voicechat-welcome");
+    m.extend_from_slice(ask);
+    m.extend_from_slice(&host_id.to_be_bytes());
+    m.extend_from_slice(&guest_id.to_be_bytes());
+    m
+}
+
+/// То же для ответа гостя.
+fn auth_msg(challenge: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(challenge.len() + 14);
+    m.extend_from_slice(b"voicechat-auth");
+    m.extend_from_slice(challenge);
+    m
+}
+
+/// Чей это пакет на самом деле.
+///
+/// Номер в теле — не доказательство: его пишет отправитель. Верим ему
+/// ровно в одном случае — когда пакет пришёл от хоста: хост пересылает
+/// чужую речь и перед пересылкой подставляет туда проверенный номер.
+/// Во всех остальных случаях номер обязан совпасть с тем, кого мы узнали
+/// по адресу.
+fn speaker(sender: Option<u16>, body: &[u8], room: &RoomRef, is_host: bool) -> Option<u16> {
+    if body.len() < 2 {
+        return None;
+    }
+    let claimed = u16::from_be_bytes([body[0], body[1]]);
+    let sender = sender?;
+    if !is_host && sender == room.host_id() {
+        // Хост говорит и за себя, и за других — но только он.
+        return Some(claimed);
+    }
+    (sender == claimed).then_some(sender)
+}
+
+/// Копия пакета с подставленным номером отправителя.
+fn with_src(packet: &[u8], src: u16) -> Vec<u8> {
+    let mut out = packet.to_vec();
+    if out.len() >= 6 {
+        out[4..6].copy_from_slice(&src.to_be_bytes());
+    }
+    out
 }
 
 /// Рассылает состав комнаты и отдаёт его же вызывающему.
@@ -1126,6 +1216,30 @@ fn spawn_rx(
             // на каждом пакете, а не запоминаем при запуске.
             let is_host = room.is_host();
 
+            // Кто прислал пакет — решаем по адресу, а не по тому, что
+            // написано в теле. Это ключевое место: почти всё остальное в
+            // протоколе доверяло номеру из тела пакета, а его может
+            // написать кто угодно. Отправитель либо проверенный участник
+            // (у хоста), либо сам хост, либо тот, до кого хост дал нам
+            // прямой путь.
+            let sender: Option<u16> = if is_host {
+                table
+                    .lock()
+                    .unwrap()
+                    .peers
+                    .iter()
+                    .find(|p| p.addr == from && p.verified)
+                    .map(|p| p.id)
+            } else if *locked.lock().unwrap() == Some(from) {
+                Some(room.host_id())
+            } else {
+                mesh.lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(_, a)| **a == from)
+                    .map(|(id, _)| *id)
+            };
+
             // Любой разобранный пакет от хоста — признак, что связь жива.
             // Молчание дольше HOST_SILENCE означает, что путь оборвался.
             if !is_host && *locked.lock().unwrap() == Some(from) {
@@ -1134,22 +1248,32 @@ fn spawn_rx(
                     .lock()
                     .unwrap()
                     .peer_seen
-                    .insert(HOST_ID, Instant::now());
+                    .insert(room.host_id(), Instant::now());
             }
 
             match kind {
                 T_HELLO if is_host => {
-                    if body.len() < 33 {
+                    if body.len() < 48 {
                         continue;
                     }
                     let mut public = [0u8; 32];
                     public.copy_from_slice(&body[..32]);
-                    let name = String::from_utf8_lossy(&body[32..])
+                    // Задача от гостя: он хочет убедиться, что мы — это мы.
+                    let ask = &body[32..48];
+                    let name = String::from_utf8_lossy(&body[48..])
                         .chars()
                         .take(24)
                         .collect::<String>();
 
                     let mut t = table.lock().unwrap();
+                    // Комната не резиновая. Без этого поток HELLO со
+                    // случайными ключами набивал таблицу без предела —
+                    // и это укладывало приложение по памяти.
+                    if t.peers.len() >= MAX_PEERS
+                        && !t.peers.iter().any(|p| p.public == public)
+                    {
+                        continue;
+                    }
                     // Человека узнаём по ключу, а не по адресу: адрес меняется
                     // от переключения сети, а ключ — нет.
                     let (id, challenge) = match t.peers.iter_mut().find(|p| p.public == public) {
@@ -1159,19 +1283,38 @@ fn spawn_rx(
                         }
                         Some(p) => {
                             // Тот же ключ с нового адреса — похоже, сеть у
-                            // человека сменилась. Даём свежую задачу и ждём
-                            // подписи, прежде чем переезжать.
-                            p.pending_addr = Some(from);
-                            p.challenge = identity::random_bytes::<16>();
-                            p.joined = Instant::now();
-                            (p.id, p.challenge)
+                            // человека сменилась. Даём задачу этому адресу
+                            // и ждём подписи, прежде чем переезжать.
+                            if p.pending.len() >= 4 && !p.pending.contains_key(&from) {
+                                continue;
+                            }
+                            let ask = match p.pending.get(&from) {
+                                Some(c) => *c,
+                                None => {
+                                    let Ok(fresh) = identity::random_bytes::<16>() else {
+                                        continue;
+                                    };
+                                    p.pending.insert(from, fresh);
+                                    fresh
+                                }
+                            };
+                            (p.id, ask)
                         }
                         None => {
                             let id = t.next_id;
+                            // Номера не должны ни переполниться, ни начать
+                            // повторяться: к номеру привязаны громкости,
+                            // заглушки и дорожки микшера. Кончились — не
+                            // пускаем, это честнее, чем выдать дубль.
+                            if id == u16::MAX {
+                                continue;
+                            }
                             t.next_id += 1;
                             // Случайная строка, которую гость должен подписать.
                             // Без неё открытый ключ можно было бы просто скопировать.
-                            let challenge = identity::random_bytes::<16>();
+                            let Ok(challenge) = identity::random_bytes::<16>() else {
+                                continue;
+                            };
                             t.peers.push(Peer {
                                 id,
                                 name: name.clone(),
@@ -1179,7 +1322,7 @@ fn spawn_rx(
                                 last_seen: Instant::now(),
                                 public,
                                 challenge,
-                                pending_addr: None,
+                                pending: HashMap::new(),
                                 verified: false,
                                 joined: Instant::now(),
                             });
@@ -1199,6 +1342,9 @@ fn spawn_rx(
                     // Свой номер: хостом мог стать гость, и вернувшемуся
                     // неоткуда узнать, под каким номером его теперь искать.
                     msg.extend_from_slice(&room.host_id().to_be_bytes());
+                    // И подпись под задачей гостя: доказательство, что
+                    // ключом владеем мы, а не тот, кто увидел код.
+                    msg.extend_from_slice(&identity.sign(&welcome_msg(ask, room.host_id(), id)));
                     let _ = socket.send_to(&msg, from);
                 }
 
@@ -1214,15 +1360,24 @@ fn spawn_rx(
                     let Some(p) = t
                         .peers
                         .iter_mut()
-                        .find(|p| p.id == id && (p.addr == from || p.pending_addr == Some(from)))
+                        .find(|p| p.id == id && (p.addr == from || p.pending.contains_key(&from)))
                     else {
                         continue;
                     };
-                    let moving = p.pending_addr == Some(from) && p.addr != from;
+                    let moving = p.addr != from;
                     if p.verified && !moving {
                         continue;
                     }
-                    if !identity::verify(&p.public, &p.challenge, &sig) {
+                    // Задача та, что выдана именно этому адресу.
+                    let ask = if moving {
+                        match p.pending.get(&from) {
+                            Some(c) => *c,
+                            None => continue,
+                        }
+                    } else {
+                        p.challenge
+                    };
+                    if !identity::verify(&p.public, &auth_msg(&ask), &sig) {
                         let name = p.name.clone();
                         drop(t);
                         shared
@@ -1235,7 +1390,7 @@ fn spawn_rx(
                     p.last_seen = Instant::now();
                     if moving {
                         p.addr = from;
-                        p.pending_addr = None;
+                        p.pending.clear();
                     }
                     let (name, fp) = (p.name.clone(), identity::fingerprint(&p.public));
                     drop(t);
@@ -1247,6 +1402,8 @@ fn spawn_rx(
                             .log(format!("{name} переехал на {from}"));
                     }
 
+                    // Вот здесь запоминать можно: подпись только что
+                    // сошлась, значит ключом владеет тот, кто его предъявил.
                     let trust = known.check(&name, &fp);
                     known.remember(&name, &fp);
                     {
@@ -1271,6 +1428,26 @@ fn spawn_rx(
                     // Ради этого и затевалось: человек возвращается по
                     // старому коду, а не выясняет в игровом чате, у кого
                     // теперь комната.
+                    //
+                    // Но показываем только тому, кого знаем в лицо. Раньше
+                    // мы выдавали ключ и адрес хоста любому, кто прислал
+                    // четыре байта, — это и утечка, и усилитель для чужого
+                    // потока: на короткий запрос уходил ответ вчетверо
+                    // длиннее, с подставным обратным адресом.
+                    if body.len() < 32 {
+                        continue;
+                    }
+                    let mut asker = [0u8; 32];
+                    asker.copy_from_slice(&body[..32]);
+                    let ours = room
+                        .roster
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(_, _, pk, _)| *pk == asker);
+                    if !ours {
+                        continue;
+                    }
                     let hid = room.host_id();
                     let roster = room.roster.lock().unwrap().clone();
                     let Some((_, _, pk, addr)) = roster.iter().find(|(i, _, _, _)| *i == hid)
@@ -1304,17 +1481,41 @@ fn spawn_rx(
                     {
                         continue;
                     }
-                    // Объявиться хостом может кто угодно — верим только тому,
-                    // чей ключ был в известном нам составе. Сверяем именно
-                    // ключ, а не номер: в комнате, поднятой из памяти, номера
-                    // у нас свои, придуманные при чтении файла.
+
+                    // Комнату не отдаём, пока прежний хост жив. Иначе любой
+                    // участник забирал бы её себе одним пакетом посреди
+                    // разговора.
+                    let in_room = locked.lock().unwrap().is_some() || is_host;
+                    if in_room
+                        && !room.host_gone.load(Ordering::Relaxed)
+                        && host_seen.lock().unwrap().elapsed() < HOST_SILENCE
+                    {
+                        continue;
+                    }
                     let roster = room.roster.lock().unwrap().clone();
-                    let known = roster.iter().any(|(_, _, k, _)| *k == pk);
-                    // Либо перенаправление пришло от того, к кому мы сами
-                    // стучимся. Доверие тут ровно то же, что и к коду
-                    // приглашения: мы выбрали этот адрес, значит верим ему.
-                    let by_code = room.targets.lock().unwrap().contains(&from);
-                    if !known && !by_code {
+
+                    // Два разных случая, и путать их нельзя.
+                    //
+                    // Первый: мы в комнате, и кто-то объявляет себя новым
+                    // хостом. Верим, только если пакет пришёл именно от
+                    // него самого (узнали по адресу) и если ключ сходится с
+                    // тем, что стоит в составе под этим номером. Раньше
+                    // хватало «такой ключ где-то в составе есть» — а свой
+                    // ключ в составе есть у каждого участника, и любой из
+                    // них мог увести комнату.
+                    let announced = sender == Some(id)
+                        && roster
+                            .iter()
+                            .any(|(i, _, k, _)| *i == id && *k == pk);
+
+                    // Второй: мы ещё стучимся и получили перенаправление от
+                    // того, к кому шли. Проверять нечего и незачем: доверие
+                    // тут ровно то же, что и к коду приглашения, а ключ
+                    // хоста всё равно будет проверен подписью.
+                    let by_code = locked.lock().unwrap().is_none()
+                        && room.targets.lock().unwrap().contains(&from);
+
+                    if !announced && !by_code {
                         continue;
                     }
                     // Если хост сейчас мы, уступаем только младшему номеру:
@@ -1329,8 +1530,15 @@ fn spawn_rx(
                 }
 
                 T_PEERS if !is_host => {
+                    // Только от хоста. Раньше состав комнаты принимался от
+                    // кого угодно — а из него растёт всё остальное: куда
+                    // слать звук, кому верить, кого выбирать хостом. Один
+                    // пакет от постороннего отдавал ему комнату целиком.
+                    if *locked.lock().unwrap() != Some(from) {
+                        continue;
+                    }
                     let roster = decode_peers(body);
-                    if roster.is_empty() {
+                    if roster.is_empty() || roster.len() > MAX_PEERS + 1 {
                         continue;
                     }
                     // Состав нужен не только для показа: если хост уйдёт,
@@ -1366,11 +1574,15 @@ fn spawn_rx(
                     for (id, name, pk, _) in &roster {
                         let fp = identity::fingerprint(pk);
                         let trust = known.check(name, &fp);
-                        if !sh.fingerprints.contains_key(id) {
-                            if trust == Trust::Changed {
-                                sh.log(format!("ВНИМАНИЕ: у {name} другой ключ ({fp})"));
-                            }
-                            known.remember(name, &fp);
+                        // Показываем, но НЕ запоминаем. Состав приходит от
+                        // хоста, а подписи этих людей проверял он, не мы.
+                        // Раньше здесь ключ из чужих рук записывался в файл
+                        // знакомых — и потом настоящий человек приходил под
+                        // предупреждением «у него другой ключ», а самозванец
+                        // проходил молча. Это ровно наоборот тому, ради чего
+                        // доверие при первой встрече и придумано.
+                        if sh.trust.get(id) != Some(&trust) && trust == Trust::Changed {
+                            sh.log(format!("ВНИМАНИЕ: у {name} другой ключ ({fp})"));
                         }
                         sh.fingerprints.insert(*id, fp);
                         sh.trust.insert(*id, trust);
@@ -1378,12 +1590,38 @@ fn spawn_rx(
                 }
 
                 T_WELCOME if !is_host => {
-                    if body.len() >= 52 {
+                    // Пока мы уже в комнате, второе приглашение нам не
+                    // нужно. Раньше любой мог переслать подслушанный
+                    // WELCOME со своего адреса и перецепить нас на себя
+                    // посреди разговора — подпись-то в нём настоящая.
+                    if locked.lock().unwrap().is_some() {
+                        continue;
+                    }
+                    // И отвечать нам может только тот, к кому мы стучались.
+                    if !room.targets.lock().unwrap().contains(&from) {
+                        continue;
+                    }
+                    if body.len() >= 116 {
                         let id = u16::from_be_bytes([body[0], body[1]]);
                         let challenge = &body[2..18];
                         let mut host_pk = [0u8; 32];
                         host_pk.copy_from_slice(&body[18..50]);
                         let host_id = u16::from_be_bytes([body[50], body[51]]);
+                        let mut host_sig = [0u8; 64];
+                        host_sig.copy_from_slice(&body[52..116]);
+
+                        // Хост обязан подписать нашу задачу. Это и есть
+                        // вторая половина опознания: раньше подпись
+                        // предъявлял только гость, и хостом мог назваться
+                        // любой, кто видел код приглашения.
+                        let ask = *room.my_challenge.lock().unwrap();
+                        if !identity::verify(&host_pk, &welcome_msg(&ask, host_id, id), &host_sig) {
+                            shared
+                                .lock()
+                                .unwrap()
+                                .log("на стук ответили без подписи — не подключаемся");
+                            continue;
+                        }
 
                         // Ключ из кода приглашения обязан совпасть: иначе это
                         // не тот, к кому нас звали.
@@ -1398,12 +1636,16 @@ fn spawn_rx(
                             // Возвращаемся в запомненную комнату: кто в ней
                             // теперь хост — неизвестно, но он обязан быть
                             // одним из тех, кого мы там видели.
-                            let ok = room
-                                .roster
-                                .lock()
-                                .unwrap()
-                                .iter()
-                                .any(|(_, _, pk, _)| *pk == host_pk);
+                            //
+                            // Пустой состав означает другое: адрес вписали
+                            // руками, ключа мы не знаем и знать не могли.
+                            // Тогда доверие — к адресу, как при входе по
+                            // коду: подпись уже проверена выше, а смену
+                            // ключа под знакомым именем поймает первая
+                            // встреча.
+                            let roster = room.roster.lock().unwrap().clone();
+                            let ok = roster.is_empty()
+                                || roster.iter().any(|(_, _, pk, _)| *pk == host_pk);
                             if !ok {
                                 shared
                                     .lock()
@@ -1414,10 +1656,16 @@ fn spawn_rx(
                         }
                         *room.host_id.lock().unwrap() = host_id;
                         room.joined.store(true, Ordering::Relaxed);
+                        // Задача отработала: следующая попытка получит новую,
+                        // чтобы этот же подписанный ответ нельзя было
+                        // предъявить снова.
+                        if let Ok(fresh) = identity::random_bytes::<16>() {
+                            *room.my_challenge.lock().unwrap() = fresh;
+                        }
 
                         let mut reply = header(T_AUTH);
                         reply.extend_from_slice(&id.to_be_bytes());
-                        reply.extend_from_slice(&identity.sign(challenge));
+                        reply.extend_from_slice(&identity.sign(&auth_msg(challenge)));
                         let _ = socket.send_to(&reply, from);
 
                         *my_id.lock().unwrap() = id;
@@ -1456,18 +1704,26 @@ fn spawn_rx(
                     if body.len() < 5 {
                         continue;
                     }
-                    let src = u16::from_be_bytes([body[0], body[1]]);
+                    let Some(src) = speaker(sender, body, &room, is_host) else {
+                        continue;
+                    };
                     let seq = u16::from_be_bytes([body[2], body[3]]);
                     let voiced = body[4] & 1 != 0;
 
-                    // Хост пересылает пакет всем остальным как есть.
+                    // Хост пересылает пакет остальным, подставив настоящий
+                    // номер отправителя. Без этого пересылка была бы дырой:
+                    // участник написал бы в теле чужой номер, а хост
+                    // добросовестно разнёс бы это всем как чужую речь.
                     if is_host {
                         let mut t = table.lock().unwrap();
                         if let Some(p) = t.peers.iter_mut().find(|p| p.addr == from) {
                             p.last_seen = Instant::now();
                         }
-                        for addr in t.addrs_except(Some(from)) {
-                            let _ = socket.send_to(&buf[..n], addr);
+                        let addrs = t.addrs_except(Some(from));
+                        drop(t);
+                        let out = with_src(&buf[..n], src);
+                        for addr in addrs {
+                            let _ = socket.send_to(&out, addr);
                         }
                     }
 
@@ -1497,12 +1753,22 @@ fn spawn_rx(
                         }
                     }
 
+                    // Новый декодер заводим, только пока их немного: на
+                    // каждого собеседника это состояние Opus и дорожка
+                    // микшера, и раньше посторонний мог развести их
+                    // десятками тысяч, уложив приложение по памяти.
+                    let full = streams.len() >= MAX_STREAMS;
                     let stream = match streams.entry(src) {
                         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                        std::collections::hash_map::Entry::Vacant(e) => match Incoming::new() {
-                            Ok(v) => e.insert(v),
-                            Err(_) => continue,
-                        },
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            if full {
+                                continue;
+                            }
+                            match Incoming::new() {
+                                Ok(v) => e.insert(v),
+                                Err(_) => continue,
+                            }
+                        }
                     };
 
                     decoded.clear();
@@ -1527,16 +1793,19 @@ fn spawn_rx(
                     if body.len() < 3 {
                         continue;
                     }
-                    let src = u16::from_be_bytes([body[0], body[1]]);
+                    let Some(src) = speaker(sender, body, &room, is_host) else {
+                        continue;
+                    };
                     let text = String::from_utf8_lossy(&body[2..])
                         .chars()
                         .take(400)
                         .collect::<String>();
 
                     if is_host {
-                        let t = table.lock().unwrap();
-                        for addr in t.addrs_except(Some(from)) {
-                            let _ = socket.send_to(&buf[..n], addr);
+                        let addrs = table.lock().unwrap().addrs_except(Some(from));
+                        let out = with_src(&buf[..n], src);
+                        for addr in addrs {
+                            let _ = socket.send_to(&out, addr);
                         }
                     }
 
@@ -1552,14 +1821,18 @@ fn spawn_rx(
                     if body.len() < 3 {
                         continue;
                     }
-                    let src = u16::from_be_bytes([body[0], body[1]]);
+                    let Some(src) = speaker(sender, body, &room, is_host) else {
+                        continue;
+                    };
                     let muted = body[2] & 1 != 0;
 
-                    // Хост пересылает состояние остальным.
+                    // Хост пересылает состояние остальным, тоже подставив
+                    // настоящий номер.
                     if is_host {
-                        let t = table.lock().unwrap();
-                        for addr in t.addrs_except(Some(from)) {
-                            let _ = socket.send_to(&buf[..n], addr);
+                        let addrs = table.lock().unwrap().addrs_except(Some(from));
+                        let out = with_src(&buf[..n], src);
+                        for addr in addrs {
+                            let _ = socket.send_to(&out, addr);
                         }
                     }
 
@@ -1573,6 +1846,9 @@ fn spawn_rx(
                 }
 
                 T_PING if is_host => {
+                    if sender.is_none() {
+                        continue;
+                    }
                     let mut t = table.lock().unwrap();
                     let id = t.peers.iter_mut().find(|p| p.addr == from).map(|p| {
                         p.last_seen = Instant::now();
@@ -1589,6 +1865,18 @@ fn spawn_rx(
                         continue;
                     }
                     let who = u16::from_be_bytes([body[0], body[1]]);
+                    // Прощаться можно только за себя, а пересылать чужое
+                    // прощание — только хосту. Раньше любой мог одним
+                    // пакетом выкинуть из комнаты кого угодно, а назвав
+                    // номер хоста — устроить перевыборы, и так по кругу.
+                    let ok = match sender {
+                        Some(s) if s == who => true,
+                        Some(s) => s == room.host_id(),
+                        None => false,
+                    };
+                    if !ok {
+                        continue;
+                    }
                     if who == room.host_id() {
                         // Ушёл хост. Ждать двенадцать секунд тишины незачем —
                         // он сказал об этом сам.
@@ -1606,8 +1894,15 @@ fn spawn_rx(
                 }
 
                 T_BYE if is_host => {
-                    // Гостям пересылаем как есть: они снимут человека сразу,
-                    // а не через таймаут.
+                    // Только от того, кто в комнате, и только за себя.
+                    // Раньше хост пересылал это всем ещё до проверки, то
+                    // есть послушно разносил чужую команду «выкинуть».
+                    if body.len() < 2 || sender.is_none() {
+                        continue;
+                    }
+                    if sender != Some(u16::from_be_bytes([body[0], body[1]])) {
+                        continue;
+                    }
                     {
                         let t = table.lock().unwrap();
                         for addr in t.addrs_except(Some(from)) {
@@ -1884,6 +2179,11 @@ fn spawn_keepalive(
                     // Прямые пути до остальных при этом не трогаем — они
                     // ни в чём не виноваты, и звук по ним идёт как шёл.
                     *locked.lock().unwrap() = None;
+                    // Новая задача на каждую попытку: подписанный ответ,
+                    // записанный кем-то раньше, не должен подойти снова.
+                    if let Ok(fresh) = identity::random_bytes::<16>() {
+                        *room.my_challenge.lock().unwrap() = fresh;
+                    }
                     drops += 1;
                     hinted = false;
                     tick = 1;
@@ -1910,6 +2210,7 @@ fn spawn_keepalive(
                     // пока NAT не откроет путь.
                     let mut msg = header(T_HELLO);
                     msg.extend_from_slice(&identity.public);
+                    msg.extend_from_slice(&*room.my_challenge.lock().unwrap());
                     msg.extend_from_slice(nickname.as_bytes());
                     for addr in room.targets.lock().unwrap().iter() {
                         let _ = socket.send_to(&msg, *addr);
@@ -1945,4 +2246,113 @@ fn spawn_keepalive(
             thread::sleep(Duration::from_millis(40));
         }
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Поток случайных байт без внешних зависимостей: для проверки того,
+    /// что разбор пакетов не падает ни на чём.
+    struct Noise(u64);
+    impl Noise {
+        fn byte(&mut self) -> u8 {
+            // xorshift: годится ровно для того, чтобы насыпать мусора.
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 33) as u8
+        }
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| self.byte()).collect()
+        }
+    }
+
+    /// Главное, чего мы боимся: чтобы специально сделанный пакет не ронял
+    /// приложение. Падение — это отказ в обслуживании всем, кому его
+    /// послали, поэтому сыплем мусор во все разборщики.
+    #[test]
+    fn разбор_не_падает_на_мусоре() {
+        let mut noise = Noise(0x5EED);
+        for len in 0..300usize {
+            for _ in 0..20 {
+                let junk = noise.bytes(len);
+                let _ = decode_peers(&junk);
+                let _ = decode_addr(&junk);
+                let text = String::from_utf8_lossy(&junk).to_string();
+                let _ = decode_invite(&text);
+                let _ = invite_key(&text);
+                let _ = identity::from_hex(&text);
+                let _ = identity::parse_public(&text);
+            }
+        }
+    }
+
+    /// Та самая паника, из-за которой присланный «код приглашения» ронял
+    /// приложение: срез строки попадал внутрь многобайтового знака.
+    #[test]
+    fn многобайтовые_знаки_не_роняют_разбор() {
+        for s in ["\u{20ac}\u{20ac}", "\u{439}\u{439}", "\u{2014}", "a\u{20ac}", "\u{401}\u{401}\u{401}"] {
+            assert!(identity::from_hex(s).is_none());
+            assert!(identity::parse_public(s).is_err());
+        }
+        assert_eq!(identity::from_hex("0aFF"), Some(vec![0x0a, 0xff]));
+        assert_eq!(identity::from_hex("abc"), None);
+        assert_eq!(identity::from_hex("zz"), None);
+    }
+
+    #[test]
+    fn адрес_короче_шести_байт_не_падает() {
+        for n in 0..6 {
+            assert!(decode_addr(&vec![7u8; n]).is_none());
+        }
+        assert!(decode_addr(&[127, 0, 0, 1, 0xB8, 0x0C]).is_some());
+    }
+
+    #[test]
+    fn состав_комнаты_переживает_дорогу_туда_и_обратно() {
+        let roster: Vec<RosterEntry> = vec![
+            (1, "\u{414}\u{430}\u{43d}\u{44f}".into(), [7u8; 32], "127.0.0.1:47100".parse().ok()),
+            (2, "\u{41b}\u{438}\u{437}\u{430}".into(), [9u8; 32], None),
+        ];
+        let bytes = encode_peers(&roster);
+        let back = decode_peers(&bytes[4..]);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].0, 1);
+        assert_eq!(back[0].2, [7u8; 32]);
+        assert_eq!(back[1].3, None);
+    }
+
+    /// Взаимное опознание: подпись сходится только у владельца ключа и
+    /// только под той задачей, которую ему дали.
+    #[test]
+    fn подпись_проверяется_и_не_переигрывается() {
+        let me = Identity::from_seed_for_test([3u8; 32]);
+        let ask = [42u8; 16];
+        let sig = me.sign(&ask);
+
+        assert!(identity::verify(&me.public, &ask, &sig));
+        // Другая задача — записанный ответ не подходит.
+        assert!(!identity::verify(&me.public, &[43u8; 16], &sig));
+        // Чужой ключ — не подходит.
+        let other = Identity::from_seed_for_test([4u8; 32]);
+        assert!(!identity::verify(&other.public, &ask, &sig));
+        // Испорченная подпись — не подходит.
+        let mut broken = sig;
+        broken[0] ^= 1;
+        assert!(!identity::verify(&me.public, &ask, &broken));
+    }
+
+    #[test]
+    fn джиттер_буфер_не_растёт_без_предела() {
+        let mut inc = Incoming::new().unwrap();
+        let mut pcm = vec![0i16; FRAME * 2];
+        let mut out = Vec::new();
+        for seq in (0u16..2000).step_by(7) {
+            inc.push(seq, &[0xFC, 0xFF, 0xFE], &mut pcm, &mut out);
+            assert!(inc.pending.len() <= JITTER_FRAMES * 6);
+            out.clear();
+        }
+    }
 }

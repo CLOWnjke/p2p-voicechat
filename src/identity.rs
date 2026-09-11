@@ -22,19 +22,27 @@ pub struct Identity {
 }
 
 impl Identity {
-    pub fn load_or_create() -> Self {
+    pub fn load_or_create() -> Result<Self> {
         let path = key_path();
         if let Some(seed) = path.as_ref().and_then(|p| read_seed(p)) {
-            return Self::from_seed(seed);
+            return Ok(Self::from_seed(seed));
         }
 
-        let seed = random_bytes::<32>();
+        let seed = random_bytes::<32>()?;
         if let Some(p) = &path {
             if let Some(dir) = p.parent() {
                 let _ = fs::create_dir_all(dir);
             }
             let _ = fs::write(p, hex(&seed));
+            restrict(p);
         }
+        Ok(Self::from_seed(seed))
+    }
+
+    /// Тот же путь, что и обычное создание, но без файла на диске:
+    /// нужен проверкам, чтобы не трогать настоящий ключ человека.
+    #[cfg(test)]
+    pub fn from_seed_for_test(seed: [u8; 32]) -> Self {
         Self::from_seed(seed)
     }
 
@@ -68,20 +76,18 @@ pub fn fingerprint(public: &[u8; 32]) -> String {
     format!("{}-{}", &h[..4], &h[4..])
 }
 
-pub fn random_bytes<const N: usize>() -> [u8; N] {
+/// Случайные байты от системы.
+///
+/// Запасного пути нет намеренно. Раньше здесь при отказе системного
+/// источника байты строились из текущего времени — и ключ, и случайные
+/// задачи для подписи становились предсказуемыми по моменту запуска, то
+/// есть подбирались перебором. Молча выдать слабый ключ хуже, чем не
+/// запуститься: человек будет думать, что защищён.
+pub fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut buf = [0u8; N];
-    if getrandom::fill(&mut buf).is_err() {
-        // Запасной путь на случай, если системный источник недоступен.
-        // Он слабее, но лучше, чем нули.
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0x9E37_79B9);
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = ((t >> ((i % 16) * 8)) as u8) ^ (i as u8).wrapping_mul(97);
-        }
-    }
-    buf
+    getrandom::fill(&mut buf)
+        .map_err(|e| anyhow!("система не выдала случайные числа: {e}"))?;
+    Ok(buf)
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -89,13 +95,41 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    // Работаем по байтам, а не по срезам строки. Срез `&s[i..i+2]` падает,
+    // если попадает внутрь многобайтового знака, — а сюда приходит и код
+    // приглашения от постороннего, и содержимое файла с диска. Падение от
+    // вставленной строки — это отказ в обслуживании одним сообщением.
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+    let digit = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    };
+    bytes
+        .chunks(2)
+        .map(|p| Some(digit(p[0])? << 4 | digit(p[1])?))
         .collect()
+}
+
+/// Закрывает файл от других пользователей машины. Секретный ключ не
+/// должен лежать с правами «читать всем»: на общем компьютере его просто
+/// заберут и будут говорить от вашего имени.
+fn restrict(path: &PathBuf) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 /// Путь к файлу рядом с настройками. Каталог у всех свой, поэтому спрашиваем

@@ -79,7 +79,9 @@ struct App {
     /// подвесить окно.
     dev_lists: Option<(Vec<String>, Vec<String>)>,
     /// Своя пара ключей: имя — это просто строка, а ключ подделать нельзя.
-    identity: Arc<identity::Identity>,
+    /// Пусто — значит система не выдала случайных чисел и входить в
+    /// комнату нельзя: без ключа нас никто не отличит от самозванца.
+    identity: Option<Arc<identity::Identity>>,
     /// Имена из запомненной комнаты — для кнопки возвращения.
     last_room: Vec<String>,
     /// Прошлый снимок счётчиков нагрузки и время, когда он сделан.
@@ -96,6 +98,8 @@ struct App {
     /// Значок в углу экрана. Пока он есть, крестик прячет окно, а закрыть
     /// приложение можно только из его меню.
     tray: Option<tray::Tray>,
+    /// Что нажали в значке. Копится в своём потоке, разбирается здесь.
+    tray_cmds: tray::Queue,
     /// Окно спрятано в значок.
     hidden: bool,
     /// Выходим по-настоящему: закрытие больше не перехватываем.
@@ -126,6 +130,21 @@ impl App {
         // цветами на первом кадре.
         ui::set_theme(settings.theme);
         setup_theme(&cc.egui_ctx);
+
+        // События значка разбираются в своём потоке: отрисовка спрятанного
+        // окна идёт раз в секунду, и нажатие ждало бы её. Поток замечает
+        // нажатие за сорок миллисекунд и будит окно сам.
+        let ctx = cc.egui_ctx.clone();
+        let tray_cmds = tray::spawn_watcher(move || ctx.request_repaint());
+
+        // Без своего ключа приложение работать не должно: имя подделать
+        // может кто угодно, ключ — нет. Если система не выдала случайных
+        // чисел, честнее сказать об этом, чем выдать предсказуемый ключ.
+        let (identity, key_error) = match identity::Identity::load_or_create() {
+            Ok(id) => (Some(Arc::new(id)), None),
+            Err(e) => (None, Some((format!("Не удалось создать ключ: {e}"), Instant::now()))),
+        };
+
         Self {
             shared: Arc::new(Mutex::new(net::Shared::default())),
             phase: Phase::Menu,
@@ -134,7 +153,7 @@ impl App {
             punch_input: String::new(),
             chat_input: String::new(),
             chat_seen: 0,
-            error: None,
+            error: key_error,
             engine: None,
             pending: None,
             copied_at: None,
@@ -143,7 +162,7 @@ impl App {
             last_frame: Instant::now(),
             devices: settings.devices(),
             dev_lists: None,
-            identity: Arc::new(identity::Identity::load_or_create()),
+            identity,
             last_room: net::last_room().into_iter().map(|(_, _, n)| n).collect(),
             load_mark: None,
             load_shown: [0.0; 6],
@@ -153,6 +172,7 @@ impl App {
                 let (rgba, w, h) = icon_rgba();
                 tray::Tray::new(rgba, w, h)
             },
+            tray_cmds,
             hidden: false,
             quitting: false,
             active_since: None,
@@ -202,13 +222,22 @@ impl App {
             return;
         }
 
+        let Some(id) = self.identity.clone() else {
+            self.error = Some((
+                "Без своего ключа входить в комнату нельзя: вас невозможно \
+                 будет отличить от самозванца."
+                    .into(),
+                Instant::now(),
+            ));
+            return;
+        };
+
         self.error = None;
         *self.shared.lock().unwrap() = net::Shared::default();
 
         let (tx, rx) = channel();
         let shared = self.shared.clone();
         let code = self.code_input.trim().to_string();
-        let id = self.identity.clone();
 
         std::thread::spawn(move || {
             let result = match mode {
@@ -285,8 +314,10 @@ impl App {
 
     /// Значок в углу экрана: разбираем нажатия и перехватываем крестик.
     fn poll_tray(&mut self, ctx: &egui::Context) {
-        let Some(tray) = &self.tray else { return };
-        let cmds = tray.poll();
+        if self.tray.is_none() {
+            return;
+        }
+        let cmds: Vec<tray::Cmd> = std::mem::take(&mut *self.tray_cmds.lock().unwrap());
         for cmd in cmds {
             match cmd {
                 tray::Cmd::Show => self.unhide(ctx),
@@ -524,7 +555,10 @@ impl eframe::App for App {
             )
         });
         let period = if minimized || self.hidden {
-            1000
+            // Реже — незачем, чаще — не нужно: нажатия в значке будят окно
+            // сами, а это просто страховка на случай, если будильник не
+            // сработает.
+            500
         } else if focused {
             16
         } else {
@@ -1675,32 +1709,6 @@ impl App {
 
         state.show_body_unindented(ui, |ui| {
             ui.add_space(8.0);
-
-            // Отпечаток ключа переехал сюда из комнаты: смотреть на него
-            // каждый раз незачем, а когда понадобится сверить — он здесь,
-            // вместе со всем остальным техническим.
-            let (r, resp) =
-                ui.allocate_exact_size(egui::vec2(ui.available_width(), 13.0), egui::Sense::hover());
-            ui.painter().text(
-                r.left_center(),
-                egui::Align2::LEFT_CENTER,
-                spaced(&format!("ВАШ КЛЮЧ · {}", self.identity.fingerprint())),
-                egui::FontId::monospace(9.5),
-                FAINT(),
-            );
-            resp.on_hover_text(
-                "Отпечаток вашего ключа. Он создаётся один раз и хранится на этом компьютере; собеседники узнают вас именно по нему, а не по имени.",
-            );
-
-            // Нагрузка живёт здесь же: это техническое наблюдение, как и
-            // сам журнал, и в разделе про обработку звука оно только
-            // оттесняло вниз ручки, ради которых туда заходят.
-            self.load_section(ui);
-
-            ui.add_space(14.0);
-            hairline(ui, LINE_DIM());
-            ui.add_space(10.0);
-
             egui::ScrollArea::vertical()
                 .max_height(300.0)
                 // Без этого область ужимается по содержимому, и полоса
@@ -1843,6 +1851,38 @@ impl App {
         let mut state = section_one_of(ui, &mut self.open_section, "log", "ЖУРНАЛ", Some((&tag, FAINT())));
         state.show_body_unindented(ui, |ui| {
             ui.add_space(8.0);
+
+            // Отпечаток ключа переехал сюда из комнаты: смотреть на него
+            // каждый раз незачем, а когда понадобится сверить — он здесь,
+            // вместе со всем остальным техническим.
+            let (r, resp) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 13.0), egui::Sense::hover());
+            ui.painter().text(
+                r.left_center(),
+                egui::Align2::LEFT_CENTER,
+                spaced(&format!(
+                    "ВАШ КЛЮЧ · {}",
+                    self.identity
+                        .as_ref()
+                        .map(|i| i.fingerprint())
+                        .unwrap_or_else(|| "нет".into())
+                )),
+                egui::FontId::monospace(9.5),
+                FAINT(),
+            );
+            resp.on_hover_text(
+                "Отпечаток вашего ключа. Он создаётся один раз и хранится на этом компьютере; собеседники узнают вас именно по нему, а не по имени.",
+            );
+
+            // Нагрузка здесь же: это техническое наблюдение, как и сам
+            // журнал, а в разделе про обработку звука оно только оттесняло
+            // вниз ручки, ради которых туда заходят.
+            self.load_section(ui);
+
+            ui.add_space(14.0);
+            hairline(ui, LINE_DIM());
+            ui.add_space(10.0);
+
             egui::ScrollArea::vertical()
                 .max_height(170.0)
                 .stick_to_bottom(true)
