@@ -284,6 +284,61 @@ fn lighten(c: Color32, k: f32) -> Color32 {
     Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
 }
 
+/// Сообщение поверх окна.
+///
+/// Раньше ошибки выводились в конце страницы, и чтобы увидеть «в коде
+/// приглашения нет адресов», надо было прокрутить в самый низ. То есть
+/// сообщение об ошибке было спрятано ровно от того, кому оно нужно.
+/// Теперь оно приходит сверху, поверх содержимого, и уходит само.
+pub fn toast(ctx: &egui::Context, text: &str, top: f32) -> bool {
+    let mut dismissed = false;
+    egui::Area::new(egui::Id::new("toast"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, top))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            let width = (ui.available_rect_before_wrap().width() - 40.0).max(240.0);
+            let galley = ui.painter().layout(
+                text.to_string(),
+                FontId::monospace(11.0),
+                DANGER(),
+                width - 54.0,
+            );
+            let h = (galley.size().y + 26.0).max(42.0);
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, h), Sense::click());
+
+            ui.painter().rect_filled(rect, CornerRadius::ZERO, BG());
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, DANGER()),
+                StrokeKind::Inside,
+            );
+            // Полоска слева вместо значка: тем же языком, что и всё вокруг.
+            ui.painter().rect_filled(
+                Rect::from_min_size(rect.left_top(), egui::vec2(3.0, rect.height())),
+                CornerRadius::ZERO,
+                DANGER(),
+            );
+            ui.painter().galley(
+                egui::pos2(rect.left() + 16.0, rect.center().y - galley.size().y / 2.0),
+                galley,
+                DANGER(),
+            );
+
+            // Крестик: закрыть руками, не дожидаясь.
+            let c = egui::pos2(rect.right() - 17.0, rect.center().y);
+            let st = Stroke::new(1.2, if resp.hovered() { TEXT() } else { DIM() });
+            let p = ui.painter();
+            p.line_segment([c + egui::vec2(-4.0, -4.0), c + egui::vec2(4.0, 4.0)], st);
+            p.line_segment([c + egui::vec2(4.0, -4.0), c + egui::vec2(-4.0, 4.0)], st);
+
+            if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                dismissed = true;
+            }
+        });
+    dismissed
+}
+
 /// В каком состоянии шаг подключения.
 #[derive(PartialEq, Clone, Copy)]
 pub enum Step {
@@ -642,24 +697,66 @@ pub fn slider(
 ///
 /// Возвращает состояние — тело рисуется через `show_body_unindented`,
 /// который сам анимирует раскрытие.
+/// Заголовок сворачиваемого раздела.
+///
+/// `only_one` — имя раздела, который единственный должен оставаться
+/// открытым. Разделы — это справочные панели, и держать их открытыми
+/// пачкой незачем: окно растёт, и нужное уезжает за край. Исключение —
+/// чат: это не справка, а разговор, его закрывать за человека нельзя.
+/// Раздел сам по себе: открывается и закрывается ни на кого не оглядываясь.
 pub fn section(
     ui: &mut Ui,
     id: &str,
     title: &str,
     right: Option<(&str, Color32)>,
 ) -> egui::collapsing_header::CollapsingState {
+    section_inner(ui, id, title, right, None)
+}
+
+/// Раздел из общей группы: открылся один — остальные закрылись.
+pub fn section_one_of(
+    ui: &mut Ui,
+    only_one: &mut Option<String>,
+    id: &str,
+    title: &str,
+    right: Option<(&str, Color32)>,
+) -> egui::collapsing_header::CollapsingState {
+    section_inner(ui, id, title, right, Some(only_one))
+}
+
+fn section_inner(
+    ui: &mut Ui,
+    id: &str,
+    title: &str,
+    right: Option<(&str, Color32)>,
+    mut only_one: Option<&mut Option<String>>,
+) -> egui::collapsing_header::CollapsingState {
     use egui::collapsing_header::CollapsingState;
 
+    let key = id.to_string();
     let id = ui.make_persistent_id(id);
     let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, false);
+
+    // Кто-то другой в группе открылся — закрываемся.
+    if let Some(sel) = only_one.as_deref() {
+        if sel.as_deref() != Some(key.as_str()) && state.is_open() {
+            state.set_open(false);
+            state.store(ui.ctx());
+        }
+    }
+
     let openness = state.openness(ui.ctx());
 
     hairline(ui, LINE());
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), Sense::click());
     if resp.clicked() {
+        let opening = !state.is_open();
         state.toggle(ui);
         state.store(ui.ctx());
+        if let Some(sel) = only_one.as_deref_mut() {
+            *sel = if opening { Some(key) } else { None };
+        }
     }
     let hovered = resp.hovered();
     if hovered {

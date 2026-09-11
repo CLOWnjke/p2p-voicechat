@@ -46,7 +46,9 @@ enum Start {
 
 enum Phase {
     Menu,
-    Connecting(String),
+    /// Идёт подготовка: открываем порт, спрашиваем адрес снаружи.
+    /// Храним затею, а не подпись: по ней видно, какие шаги показывать.
+    Connecting(Start),
     Active,
 }
 
@@ -60,7 +62,9 @@ struct App {
     /// Сколько сообщений уже видели: разница с нынешним числом и есть
     /// счётчик непрочитанного.
     chat_seen: usize,
-    error: Option<String>,
+    /// Сообщение об ошибке и когда оно появилось: через несколько секунд
+    /// гаснет само.
+    error: Option<(String, Instant)>,
     engine: Option<net::Engine>,
     pending: Option<Receiver<Result<net::Prepared, String>>>,
     copied_at: Option<Instant>,
@@ -99,6 +103,10 @@ struct App {
     /// Когда вошли в комнату (или начали в неё стучаться). По этому
     /// на экране ожидания считается, сколько мы уже ждём.
     active_since: Option<Instant>,
+    /// Какой из справочных разделов сейчас открыт. Чат в эту группу не
+    /// входит намеренно: это не справка, а разговор, и закрывать его за
+    /// человека, когда он полез в настройки, было бы наглостью.
+    open_section: Option<String>,
     /// Раскрыта ли помощь «друг не может подключиться?».
     show_punch: bool,
     /// Показывать ли сам код приглашения. По умолчанию нет: человеку
@@ -148,6 +156,7 @@ impl App {
             hidden: false,
             quitting: false,
             active_since: None,
+            open_section: None,
             show_punch: false,
             show_code: false,
             settings,
@@ -185,11 +194,11 @@ impl App {
     fn begin_mode(&mut self, mode: Start) {
         let nickname = self.nickname.trim().to_string();
         if nickname.is_empty() {
-            self.error = Some("Введите имя".into());
+            self.error = Some(("Введите имя".into(), Instant::now()));
             return;
         }
         if matches!(mode, Start::Join) && self.code_input.trim().is_empty() {
-            self.error = Some("Вставьте код приглашения".into());
+            self.error = Some(("Вставьте код приглашения".into(), Instant::now()));
             return;
         }
 
@@ -211,14 +220,8 @@ impl App {
         });
 
         self.pending = Some(rx);
-        self.phase = Phase::Connecting(
-            match mode {
-                Start::Host => "ОТКРЫВАЕМ ПОРТ",
-                Start::Join => "ИЩЕМ ХОСТА",
-                Start::Return => "СТУЧИМСЯ КО ВСЕМ",
-            }
-            .into(),
-        );
+        self.phase = Phase::Connecting(mode);
+        self.active_since = Some(Instant::now());
     }
 
     fn poll_pending(&mut self) {
@@ -241,12 +244,24 @@ impl App {
                     self.active_since = Some(Instant::now());
                 }
                 Err(e) => {
-                    self.error = Some(format!("Звук не запустился: {e}"));
+                    // Наружу — человеческая фраза, подробности библиотеки —
+                    // в журнал. «The requested audio device is not available»
+                    // человеку не говорит ничего, а пугает исправно.
+                    self.shared
+                        .lock()
+                        .unwrap()
+                        .log(format!("звук не запустился: {e}"));
+                    self.error = Some((
+                        "Не удалось включить звук. Проверьте, что микрофон и наушники \
+                         подключены, и выберите их в разделе «Устройства»."
+                            .into(),
+                        Instant::now(),
+                    ));
                     self.phase = Phase::Menu;
                 }
             },
             Err(e) => {
-                self.error = Some(e);
+                self.error = Some((e, Instant::now()));
                 self.phase = Phase::Menu;
             }
         }
@@ -537,24 +552,28 @@ impl eframe::App for App {
                         ui.add_space(16.0);
                         match &self.phase {
                             Phase::Menu => self.ui_menu(ui),
-                            Phase::Connecting(msg) => {
-                                let msg = msg.clone();
-                                self.ui_connecting(ui, &msg);
+                            Phase::Connecting(mode) => {
+                                let mode = *mode;
+                                self.ui_connecting(ui, mode);
                             }
                             Phase::Active => self.ui_active(ui),
-                        }
-                        if let Some(err) = self.error.clone() {
-                            ui.add_space(14.0);
-                            ui.horizontal(|ui| {
-                                mono(ui, "!", 11.0, DANGER());
-                                ui.add_space(6.0);
-                                mono(ui, err, 11.0, DANGER());
-                            });
                         }
                         ui.add_space(18.0);
                             });
                     });
             });
+
+        // Сообщение об ошибке — поверх содержимого, у верхнего края.
+        // В подвале страницы его не видел никто: чтобы прочитать, надо было
+        // прокрутить туда, куда не смотрят.
+        if let Some((text, at)) = self.error.clone() {
+            if at.elapsed() > Duration::from_secs(9) || toast(ui.ctx(), &text, 52.0) {
+                self.error = None;
+            } else {
+                // Пока тост висит, кадры нужны: он сам себя гасит по времени.
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+        }
 
         if let Some(load) = self.engine.as_ref().map(|e| e.controls.load.clone()) {
             load.ui_frames.fetch_add(1, Ordering::Relaxed);
@@ -653,14 +672,65 @@ impl App {
         hairline(ui, LINE());
     }
 
-    fn ui_connecting(&mut self, ui: &mut egui::Ui, msg: &str) {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.add_space(6.0);
-            mono(ui, spaced(msg), 11.0, TEXT_2());
-        });
-        ui.add_space(16.0);
+    /// Подготовка: открываем порт и узнаём свой адрес снаружи.
+    ///
+    /// Это тот же экран шагов, что и дальше, — просто первые шаги ещё не
+    /// сделаны. Человек не должен замечать границу между «готовимся» и
+    /// «стучимся»: для него это одно ожидание.
+    fn ui_connecting(&mut self, ui: &mut egui::Ui, mode: Start) {
+        let host = mode == Start::Host;
+        self.steps_header(
+            ui,
+            if host { "Открываем комнату" } else { "Ищем комнату" },
+            if host {
+                "Просим роутер пропускать входящие и узнаём,\nкак нас видно снаружи."
+            } else {
+                "Обычно занимает две-три секунды.\nЕсли дольше — подскажем, что делать."
+            },
+        );
+        ui.add_space(24.0);
+        hairline(ui, LINE());
+        self.step(ui, Step::Now, "Открываем свой порт", "и просим роутер пропускать входящие", "");
+        self.step(ui, Step::Wait, "Узнаём свой адрес снаружи", "спрашиваем у публичного сервера", "");
+        if !host {
+            self.step(ui, Step::Wait, "Стучимся к хосту", "пробуем все адреса из кода сразу", "");
+            self.step(ui, Step::Wait, "Здороваемся и входим", "сверяем ключи и занимаем место", "");
+        }
+        hairline(ui, LINE());
+
+        ui.add_space(22.0);
+        if button(ui, "ОТМЕНИТЬ", 40.0, None, None, Some(DIMMER()), TEXT_2(), 11.0).clicked() {
+            self.leave();
+            return;
+        }
+        ui.add_space(18.0);
         self.log_section(ui);
+    }
+
+    /// Заголовок экрана ожидания.
+    fn steps_header(&mut self, ui: &mut egui::Ui, title: &str, note: &str) {
+        ui.label(
+            egui::RichText::new(title)
+                .size(20.0)
+                .color(TEXT())
+                .monospace(),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(note)
+                .size(11.5)
+                .color(TEXT_2())
+                .monospace(),
+        );
+    }
+
+    /// Один шаг с разделителем под ним: чтобы вызовы читались списком,
+    /// а не чередой отступов.
+    fn step(&mut self, ui: &mut egui::Ui, state: Step, title: &str, note: &str, right: &str) {
+        ui.add_space(12.0);
+        step_row(ui, state, title, note, right);
+        ui.add_space(12.0);
+        hairline(ui, LINE_DIM());
     }
 
     /// Что видит гость, пока не вошёл в комнату.
@@ -683,30 +753,15 @@ impl App {
             .unwrap_or(0);
 
         if !stuck {
-            ui.label(
-                egui::RichText::new("Ищем комнату")
-                    .size(20.0)
-                    .color(TEXT())
-                    .monospace(),
+            self.steps_header(
+                ui,
+                "Ищем комнату",
+                "Обычно занимает две-три секунды.\nЕсли дольше — подскажем, что делать.",
             );
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(
-                    "Обычно занимает две-три секунды.\nЕсли дольше — подскажем, что делать.",
-                )
-                .size(11.5)
-                .color(TEXT_2())
-                .monospace(),
-            );
-
             ui.add_space(24.0);
             hairline(ui, LINE());
-            ui.add_space(12.0);
-            step_row(ui, Step::Done, "Открыли свой порт", "и попросили роутер пропускать входящие", "готово");
-            ui.add_space(12.0);
-            hairline(ui, LINE_DIM());
-            ui.add_space(12.0);
-            step_row(
+            self.step(ui, Step::Done, "Открыли свой порт", "и попросили роутер пропускать входящие", "готово");
+            self.step(
                 ui,
                 if invite.is_some() { Step::Done } else { Step::Now },
                 "Узнали свой адрес снаружи",
@@ -717,15 +772,8 @@ impl App {
                 },
                 if invite.is_some() { "готово" } else { "" },
             );
-            ui.add_space(12.0);
-            hairline(ui, LINE_DIM());
-            ui.add_space(12.0);
-            step_row(ui, Step::Now, "Стучимся к хосту", "пробуем все адреса из кода сразу", &format!("{waited} с"));
-            ui.add_space(12.0);
-            hairline(ui, LINE_DIM());
-            ui.add_space(12.0);
-            step_row(ui, Step::Wait, "Здороваемся и входим", "сверяем ключи и занимаем место", "");
-            ui.add_space(12.0);
+            self.step(ui, Step::Now, "Стучимся к хосту", "пробуем все адреса из кода сразу", &format!("{waited} с"));
+            self.step(ui, Step::Wait, "Здороваемся и входим", "сверяем ключи и занимаем место", "");
             hairline(ui, LINE());
 
             ui.add_space(22.0);
@@ -1383,8 +1431,9 @@ impl App {
             .clone()
             .unwrap_or_else(|| "СИСТЕМНОЕ".into());
         let short: String = picked.chars().take(18).collect();
-        let mut state = section(
+        let mut state = section_one_of(
             ui,
+            &mut self.open_section,
             "devices",
             "УСТРОЙСТВА",
             Some((&short.to_uppercase(), FAINT())),
@@ -1432,8 +1481,9 @@ impl App {
         let on = [aec0, dn0, gt0].iter().filter(|x| **x).count();
         let tag = format!("{on} / 3");
 
-        let mut state = section(
+        let mut state = section_one_of(
             ui,
+            &mut self.open_section,
             "chain",
             "ОБРАБОТКА ЗВУКА",
             Some((&tag, if on > 0 { ACCENT() } else { FAINT() })),
@@ -1466,7 +1516,6 @@ impl App {
             ui.add_space(12.0);
 
             chain(ui, aec, denoise, gate);
-            self.load_section(ui);
             ui.add_space(16.0);
             hairline(ui, LINE());
             ui.add_space(10.0);
@@ -1642,7 +1691,15 @@ impl App {
             resp.on_hover_text(
                 "Отпечаток вашего ключа. Он создаётся один раз и хранится на этом компьютере; собеседники узнают вас именно по нему, а не по имени.",
             );
-            ui.add_space(8.0);
+
+            // Нагрузка живёт здесь же: это техническое наблюдение, как и
+            // сам журнал, и в разделе про обработку звука оно только
+            // оттесняло вниз ручки, ради которых туда заходят.
+            self.load_section(ui);
+
+            ui.add_space(14.0);
+            hairline(ui, LINE_DIM());
+            ui.add_space(10.0);
 
             egui::ScrollArea::vertical()
                 .max_height(300.0)
@@ -1774,7 +1831,7 @@ impl App {
                         self.punch_input.clear();
                         self.error = None;
                     }
-                    Err(e) => self.error = Some(e.to_string()),
+                    Err(e) => self.error = Some((e.to_string(), Instant::now())),
                 }
             }
         }
@@ -1783,7 +1840,7 @@ impl App {
     fn log_section(&mut self, ui: &mut egui::Ui) {
         let lines = self.shared.lock().unwrap().log.clone();
         let tag = lines.len().to_string();
-        let mut state = section(ui, "log", "ЖУРНАЛ", Some((&tag, FAINT())));
+        let mut state = section_one_of(ui, &mut self.open_section, "log", "ЖУРНАЛ", Some((&tag, FAINT())));
         state.show_body_unindented(ui, |ui| {
             ui.add_space(8.0);
             egui::ScrollArea::vertical()
